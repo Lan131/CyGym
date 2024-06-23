@@ -127,10 +127,12 @@ def run_game(env, episodes, steps_per_episode, seed, csv_writer, test_rewards_de
 
         # Run Double Oracle algorithm to update strategies
         if episode % 2 == 0:
-            print("Set double oracle mode to defender")
+            
+
             double_oracle.env.mode = 'defender'
         else:
-            print("Set double oracle mode to attack")
+            
+
             double_oracle.env.mode = 'attacker'
         double_oracle.run()
 
@@ -152,7 +154,8 @@ def run_game(env, episodes, steps_per_episode, seed, csv_writer, test_rewards_de
                 
                 if test_step % 2 == 0:
                     env.mode = 'defender'
-                    print(double_oracle.defender_strategy_probabilities)
+                   
+
                     defender_strategy = double_oracle.sample_strategy(double_oracle.defender_strategies, double_oracle.defender_strategy_probabilities)
                     action = double_oracle.sample_action(defender_strategy, test_step)
                     obs, reward, done, info, Log = env.step(action)
