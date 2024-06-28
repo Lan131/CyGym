@@ -388,7 +388,7 @@ class DoubleOracle:
             else:
                 raise ValueError("Failed to find maximin strategy")
     
-        def random_strategy(num_strategies):
+        def random_return(num_strategies):
             strategy = np.random.random(num_strategies)
             return strategy / strategy.sum()  # Normalize
     
@@ -433,7 +433,7 @@ class DoubleOracle:
                     print("Sum of defender probabilities is zero, using fallback strategy.")
                     defender_strategy_probabilities = random_strategy(num_defender_strategies)
             else:
-                print("Defender LP failed. Falling back to maximin or random strategy.")
+                print("Defender LP failed. Falling back to maximin or random return.")
                 try:
                     defender_strategy_probabilities = maximin_strategy(defender_payoff_matrix)
                     print("Using maximin strategy for defender.")
@@ -471,7 +471,7 @@ class DoubleOracle:
                     attacker_strategy_probabilities = maximin_strategy(attacker_payoff_matrix.T)
                     print("Using maximin strategy for attacker.")
                 except ValueError:
-                    attacker_strategy_probabilities = random_strategy(num_attacker_strategies)
+                    attacker_strategy_probabilities = random_return(num_attacker_strategies)
                     print("Using random strategy for attacker.")
     
         # Normalize probabilities to ensure they sum to 1 and handle NaNs
