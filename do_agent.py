@@ -361,7 +361,7 @@ class DoubleOracle:
         Notes:
             This function computes the mixed strategy Nash equilibrium for both players in a non-zero-sum game. It uses 
             Linear Programming (LP) to find the probabilities of each player's strategies that maximize their expected 
-            minimum payoff.
+            payoff.
     
             For each player:
             - If a pure strategy exists that maximizes their payoff against all possible strategies of the opponent, it is
@@ -374,8 +374,7 @@ class DoubleOracle:
             Random Strategy:
             - If both LP and maximin strategies fail, random probabilities are returned.
     
-            The resulting strategies are normalized to ensure they sum to 1, representing the probability distribution of
-            strategies for each player at the Nash equilibrium.
+
         """
         def maximin_strategy(payoff_matrix):
             num_strategies = payoff_matrix.shape[0]
