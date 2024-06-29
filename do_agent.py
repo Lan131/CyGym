@@ -372,7 +372,7 @@ class DoubleOracle:
             - If the LP solver fails for a player, it falls back to treating the game as zero sum.
     
             Random Strategy:
-            - If both LP and maximin strategies fail, random probabilities are returned.
+            - If both fail, random probabilities are returned and a warning is generated.
     
 
         """
