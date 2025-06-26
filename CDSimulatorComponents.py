@@ -4,8 +4,6 @@ import math
 import numpy as np
 import random
 import igraph as ig
-
-
 import igraph as ig
 import numpy as np
 
@@ -24,6 +22,7 @@ class Workload:
         self.version = version  # version
         self.assigned = False
         self.adversarial = False
+        self.wtype = None  # 'client' or 'server'
         
 
 class OperatingSystem:
@@ -223,6 +222,7 @@ class Device:
         self.apps = {}
         self.address = address
         self.isCompromised = False
+        self._private_compromise = False
         self.workload = None
         self.mask = False
         self.lie = False
@@ -234,6 +234,11 @@ class Device:
         self.reachable_by_attacker = False
         self.busy_time = 0
         self.agent = None #only for maddpg when network size is large (ie >20 devices or so)
+        self.Not_yet_added = False
+        self.anomaly_score = 0
+        self.removed_before = 0 #this is a flag for use in the scanner as evolved network produce new network configurations
+        self.wtype = 'client'
+        self.compromised_by = set()
 
 
     def clone(self):
@@ -490,6 +495,7 @@ class Exploit:
         self.versionMin = 1.0
         self.versionMax = 1.0
         self.setRange(minR, maxR)
+        self.discovered = True
 
     def getId(self):
         return self.id
@@ -613,13 +619,15 @@ class Subnet:
 
         device_ids = list(self.net.keys())
         g.vs["name"] = device_ids
+        for edge in g.es:
+            edge["blocked"] = False
 
         # Store the igraph object
         self.graph = g
 
         # Convert igraph Graph object to a dictionary representation
         self.graph_dict = {device_id: g.neighbors(g.vs.find(name=device_id).index, mode="out") for device_id in device_ids}
-       
+
 
         return g
 
@@ -666,6 +674,34 @@ class Subnet:
                     g.delete_edges(g.incident(neighbor_id, mode="out"))
                     g.add_edges([(attacker_device_id, neighbor_id)])
 
+    def connectNonAttackerDevice(self, g, new_device_id, m=2):
+        """
+        Connect a newly active non-attacker-owned device to m existing active devices
+        using a Barabási preferential attachment mechanism.
+        
+        Args:
+            g: The igraph Graph object.
+            new_device_id: The device id of the new active device.
+            m: Number of connections to form.
+        """
+        # Gather candidate nodes: active nodes that are not the new device.
+        candidate_nodes = [v["name"] for v in g.vs if v.get("active", False) and v["name"] != new_device_id]
+        if not candidate_nodes:
+            return
+        # Calculate degrees for candidate nodes.
+        degrees = np.array([g.degree(v_name) for v_name in candidate_nodes])
+        total_degree = degrees.sum()
+        if total_degree == 0:
+            # If none have any connections yet, choose uniformly.
+            probabilities = np.ones(len(candidate_nodes)) / len(candidate_nodes)
+        else:
+            probabilities = degrees / total_degree
+
+        # Ensure we don't try to connect to more nodes than available.
+        m = min(m, len(candidate_nodes))
+        selected_nodes = np.random.choice(candidate_nodes, size=m, replace=False, p=probabilities)
+        for target in selected_nodes:
+            g.add_edges([(new_device_id, target)])
 
 
     def addDevices(self, device):
