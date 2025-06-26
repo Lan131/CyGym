@@ -5,7 +5,7 @@ import time
 import datetime
 import random
 import numpy as np
-
+import igraph as ig
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import IsolationForest
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
@@ -51,43 +51,49 @@ class CyberDefenseSimulator:
 
     def log_communication(self, from_device, to_device, kind):
         self.logger.log(self.system_time, from_device, to_device, kind)
-
-    def assign_workload(self, workload, adversarial = False):
+    
+    def assign_workload(self, workload, wtype=None, adversarial=False):
         for device_id, device in self.subnet.net.items():
-            '''
-            # Debugging statements
-            print(f"Checking device {device_id} with OS: {device.OS} and version: {device.version}")
-            print(f"Device OS id: {device.OS.id}, type: {device.OS.type}, version: {device.OS.version}")
-            print(f"Workload OS id: {workload.OS.id}, type: {workload.OS.type}, version: {workload.version}")
-            print(f"Workload OS: {workload.OS}, Workload version: {workload.version}")
-            '''
-            # Compare attributes directly
-            if (device.OS.id == workload.OS.id and device.OS.type == workload.OS.type and str(device.OS.version) == str(workload.version)):
+            # First try to assign the workload to the current device.
+            if (device.OS.id == workload.OS.id and 
+                device.OS.type == workload.OS.type and 
+                device.wtype == workload.wtype and
+                str(device.OS.version) == str(workload.version)):
                 if not device.workload:
                     device.workload = workload
                     workload.assigned = True
                     #print(f"Workload {workload.id} assigned to device {device_id}")
                     return True
             else:
-                # Find neighbors from graph dictionary
+                # If not assigned, try to assign to a neighbor.
                 try:
-                    neighbor_ids = self.subnet.graph.get(device_id)  # returns a list
-                except:
+                    neighbor_ids = self.subnet.graph.get(device_id)  # returns a list of neighbor IDs
+                except Exception:
                     vertex = self.subnet.graph.vs.find(name=device_id)
-                    neighbor_ids = self.subnet.graph.neighbors(vertex.index, mode="out")
-                    neighbor_ids = [self.subnet.graph.vs[neighbor].attributes()["name"] for neighbor in neighbor_ids]
+                    neighbor_indices = self.subnet.graph.neighbors(vertex.index, mode="out")
+                    neighbor_ids = [self.subnet.graph.vs[neighbor].attributes()["name"] for neighbor in neighbor_indices]
 
                 if neighbor_ids is None:
-                    # No neighbors, pass
                     continue
 
                 for neighbor_id in neighbor_ids:
+                    # Check if the edge from device_id to neighbor_id is blocked.
+                    try:
+                        source_vertex = self.subnet.graph.vs.find(name=device_id)
+                        target_vertex = self.subnet.graph.vs.find(name=neighbor_id)
+                        edge_candidates = self.subnet.graph.es.select(_source=source_vertex.index, 
+                                                                        _target=target_vertex.index)
+                        # If no edge exists or the edge is blocked, skip this neighbor.
+                        if len(edge_candidates) == 0 or edge_candidates[0]["blocked"]:
+                            continue
+                    except Exception as e:
+                        # In case of any errors during edge checking, skip this neighbor.
+                        continue
+
                     neighbor_device = self.subnet.net.get(neighbor_id)
                     self.log_communication(device_id, neighbor_id, 'D')
                     if neighbor_device:
-                        #print(f"Checking neighbor device {neighbor_id} with OS: {neighbor_device.OS} and version: {neighbor_device.version}")
-                        #print(f"Neighbor Device OS id: {neighbor_device.OS.id}, type: {neighbor_device.OS.type}, version: {neighbor_device.OS.version}")
-
+                        # Check if neighbor's OS and version match the workload.
                         if neighbor_device.OS == workload.OS and str(neighbor_device.version) == str(workload.version):
                             if not neighbor_device.workload:
                                 neighbor_device.workload = workload
@@ -100,7 +106,7 @@ class CyberDefenseSimulator:
         return False
 
 
-    def generate_workloads(self, numLoads, mode, high , adversarial = False):
+    def generate_workloads(self, numLoads, mode, high , wtype = 'client', adversarial = False):
 
 
         assigned_devices = set()  # Set to keep track of assigned devices
@@ -116,12 +122,12 @@ class CyberDefenseSimulator:
                     workload = Workload(workload_id, np.ceil(np.random.triangular(0, mode, high, 1)), selected_os, str(selected_version))
 
                     # Try to assign the workload to a device
-                    assigned = self.assign_workload(workload, adversarial = adversarial)
+                    assigned = self.assign_workload(workload, adversarial = adversarial , wtype = wtype)
                     if assigned:
                         assigned_devices.add(device_id)  # Mark the device as assigned
                         device_found = True
                         break  # Exit the loop once a device is found and assigned
-
+                    
             if not device_found:
                 pass
 
@@ -146,6 +152,7 @@ class CyberDefenseSimulator:
         reset everything in the subnet, meaning DELETING all
         """
         self.subnet.net.clear()
+        self.subnet.graph = ig.Graph()
         self.subnet.resetAllCompromisedSubnet()
         for _, device in self.subnet.net.items():
             device.set_random_success_prob()
@@ -270,6 +277,38 @@ class CyberDefenseSimulator:
 
     #  def generateNetwork
 
+
+
+    def redeploy_apps_with_unique_vulns(self,
+                                        num_apps=20,
+                                        vul_per_app=2,
+                                        min_apps_per_device=1,
+                                        max_apps_per_device=3):
+        """
+        Clears all existing apps/vulns from simulator and devices,
+        then regenerates `num_apps` apps (each with `vul_per_app` vulns)
+        and assigns each device between min_apps_per_device and max_apps_per_device of them.
+        """
+        # 1) Clear everything
+        self.apps.clear()
+        self.vulneralbilities.clear()
+        for device in self.subnet.net.values():
+            device.apps.clear()
+
+        # 2) Generate a pool of apps (with vul_per_app vulnerabilities each)
+        app_pool = self.generateApps(
+            numOfApps = num_apps,
+            addVul     = True,
+            numOfVul   = vul_per_app
+        )
+
+        # 3) Shuffle & assign to devices
+        for device in self.subnet.net.values():
+            k = random.randint(min_apps_per_device, max_apps_per_device)
+            chosen = random.sample(app_pool, k)
+            device.addApps(chosen)
+
+
     def generateVul(self, numOfVul, targetApp=None, targetOS=None, mode="random", vulID=None):
         """Generate Vulnerability, either target App is given or target OS is given, cannot be both
             numOfVul specifies the number of vul given to the target OS or App
@@ -313,6 +352,7 @@ class CyberDefenseSimulator:
         else:
             print("Invalid mode or missing vulID for target mode")
 
+        #print("Vulernability prob is: "+str(vul_probabilities))
         return vul_probabilities
 
 
@@ -326,44 +366,133 @@ class CyberDefenseSimulator:
             print("apps less than vul")
         for vul in self.vulneralbilities:
             vul.setTarget(self.randomSampleGenerator(self.appss))
-
+    '''
     def generateExploits(self, numOfExploits, addVul=False, minVulperExp=0, maxVulperExp=0, mode="random", expID=None):
-        """Generate specified input number of exploits that is added to the simulator's exploit subnet.
-        Args:
-            numOfExploits (int): Number of exploits to generate.
-            addVul (bool): Whether to add vulnerabilities to the exploit.
-            minVulperExp (int): Minimum number of vulnerabilities per exploit.
-            maxVulperExp (int): Maximum number of vulnerabilities per exploit.
-            mode (str): Mode of operation, 'random' or 'target'.
-            expID (str): Exploit ID from CSV when mode is 'target'.
-        """
-        currSize = len(self.exploits)
-        assert mode in ('random', 'target')
-        if mode == "random":
-            sampled_data = self.df.sample(n=numOfExploits)
-            for index, row in sampled_data.iterrows():
-                ExpType = 'unknown'  # Or some logic to determine type
-                newExploit = Exploit(row['matchCriteriaId'], ExpType, self.defaultApp)
-                self.exploits.append(newExploit)  # Add to list
-                if addVul:
-                    for i in range(int(self.randomNumberGenerator(minVulperExp, maxVulperExp))):
-                        vul = self.randomSampleGenerator(self.vulneralbilities)
-                        newExploit.setTargetVul(vul)
-        elif mode == "target" and expID is not None:
-            row = self.df[self.df['matchCriteriaId'] == expID]
-            if not row.empty:
-                row = row.iloc[0]
-                ExpType = 'unknown'  # Or some logic to determine type
-                newExploit = Exploit(row['matchCriteriaId'], ExpType, self.defaultApp)
-                self.exploits.append(newExploit)  # Add to list
-                if addVul:
-                    for i in range(int(self.randomNumberGenerator(minVulperExp, maxVulperExp))):
-                        vul = self.randomSampleGenerator(self.vulneralbilities)
-                        newExploit.setTargetVul(vul)
-        else:
-            print("Invalid mode or missing expID for target mode")
+            """Generate specified input number of exploits that is added to the simulator's exploit subnet.
+            Args:
+                numOfExploits (int): Number of exploits to generate.
+                addVul (bool): Whether to add vulnerabilities to the exploit.
+                minVulperExp (int): Minimum number of vulnerabilities per exploit.
+                maxVulperExp (int): Maximum number of vulnerabilities per exploit.
+                mode (str): Mode of operation, 'random' or 'target'.
+                expID (str): Exploit ID from CSV when mode is 'target'.
+            """
+            currSize = len(self.exploits)
+            assert mode in ('random', 'target')
+            if mode == "random":
+                sampled_data = self.df.sample(n=numOfExploits)
+                for index, row in sampled_data.iterrows():
+                    ExpType = 'unknown'  # Or some logic to determine type
+                    newExploit = Exploit(row['matchCriteriaId'], ExpType, self.defaultApp)
+                    self.exploits.append(newExploit)  # Add to list
+                    if addVul:
+                        for i in range(int(self.randomNumberGenerator(minVulperExp, maxVulperExp))):
+                            vul = self.randomSampleGenerator(self.vulneralbilities)
+                            newExploit.setTargetVul(vul)
+            elif mode == "target" and expID is not None:
+                row = self.df[self.df['matchCriteriaId'] == expID]
+                if not row.empty:
+                    row = row.iloc[0]
+                    ExpType = 'unknown'  # Or some logic to determine type
+                    newExploit = Exploit(row['matchCriteriaId'], ExpType, self.defaultApp)
+                    self.exploits.append(newExploit)  # Add to list
+                    if addVul:
+                        for i in range(int(self.randomNumberGenerator(minVulperExp, maxVulperExp))):
+                            vul = self.randomSampleGenerator(self.vulneralbilities)
+                            newExploit.setTargetVul(vul)
+            else:
+                print("Invalid mode or missing expID for target mode")
 
-        print(f'{numOfExploits} of Exploits added to exploits')
+            print(f'{numOfExploits} of Exploits added to exploits')
+    '''
+    def generateExploits(
+        self,
+        numOfExploits,
+        addVul=False,
+        minVulperExp=0,
+        maxVulperExp=0,
+        mode="random",
+        expID=None,
+        discovered = False
+    ):
+        """
+        Generate `numOfExploits` exploits, each targeting exactly one fresh vulnerability.
+        Signature is unchanged so existing calls still work.
+
+        Args:
+            numOfExploits (int): how many exploits to generate
+            addVul (bool): if True, also attach additional vulnerabilities from the pool
+            minVulperExp, maxVulperExp: range for number of extra vulnerabilities to attach
+            mode (str): "random" or "target"
+            expID (str): if mode=="target", the specific CVE ID to target
+        """
+        assert mode in ("random", "target"), "mode must be 'random' or 'target'"
+
+        # helper to attach extra existing vulnerabilities
+        def _attach_extra(exploit):
+            if not addVul or not self.vulneralbilities:
+                return
+            k = int(self.randomNumberGenerator(minVulperExp, maxVulperExp))
+            for _ in range(k):
+                extra_v = random.choice(list(self.vulneralbilities))
+                exploit.setTargetVul(extra_v)
+
+        if mode == "random":
+            # 1) sample that many distinct CVE rows
+            sampled = self.df.sample(n=numOfExploits, replace=False)
+            for _, row in sampled.iterrows():
+                # 2) build a fresh Vulnerability object
+                new_vul = Vulnerability(
+                    row["matchCriteriaId"],
+                    "unknown",
+                    self.defaultApp
+                )
+                new_vul.exploitability_score = row["exploitabilityScore"]
+                new_vul.impact_score        = row["impactScore"]
+                self.vulneralbilities.add(new_vul)
+
+                # 3) create an Exploit that points *only* at that new vulnerability
+                exp = Exploit(new_vul.id, "unknown", self.defaultApp)
+                exp.setTargetVul(new_vul)
+
+                # 4) optionally attach extra existing vulns
+                _attach_extra(exp)
+
+                self.exploits.append(exp)
+
+        else:  # mode == "target"
+            if expID is None:
+                print("Invalid mode or missing expID for target mode")
+                return
+            # find that CVE row
+            subset = self.df[self.df["matchCriteriaId"] == expID]
+            if subset.empty:
+                print(f"No CVE entry found for ID={expID}")
+                return
+            row = subset.iloc[0]
+            for _ in range(numOfExploits):
+                # 1) make a fresh Vulnerability with that exact ID
+                new_vul = Vulnerability(
+                    row["matchCriteriaId"],
+                    "unknown",
+                    self.defaultApp
+                )
+                new_vul.exploitability_score = row["exploitabilityScore"]
+                new_vul.impact_score        = row["impactScore"]
+                self.vulneralbilities.add(new_vul)
+
+                # 2) and an Exploit targeting it
+                exp = Exploit(new_vul.id, "unknown", self.defaultApp)
+                exp.discovered = discovered
+                exp.setTargetVul(new_vul)
+
+                # 3) optionally attach extra existing vulns
+                _attach_extra(exp)
+
+                self.exploits.append(exp)
+
+        print(f"{numOfExploits} exploits added (mode={mode}).")
+
 
     def attackSubnet(self, exploit):
         """_summary_
@@ -384,7 +513,7 @@ class CyberDefenseSimulator:
         """
         if (a == b):
             return a
-        randomNum = random.randint(a*10, b*10)/10
+        randomNum = random.randint(int(a*10), int(b*10))/10
         return randomNum
 
     def randomRangeGenerator(self, a=1.0, b=1.0):
@@ -489,9 +618,11 @@ class Logger:
     def clear_logs(self):
         self.logs = []
 
+
 class Detector:
+    
     def __init__(self, contamination=0.1):
-        self.model = IsolationForest(contamination=contamination, n_estimators=1)
+        self.model = IsolationForest(n_estimators=2, max_samples=256, n_jobs=1)
         self.trained = False
         self.random_detection = False
 
@@ -499,82 +630,33 @@ class Detector:
         if logs is None or len(logs) == 0:
             # Initialize random detection logic
             self.random_detection = True
-            print("Using random detection due to insufficient training data.")
+            #print("Using random detection due to insufficient training data.")
         else:
             X = [[log["from_device"], log["to_device"]] for log in logs]
             self.model.fit(X)
             self.trained = True
             self.random_detection = False
 
-    def predict(self, from_device, to_device):
+    def predict(self, from_device, to_device, return_score=False):
+        # Random detection mode if there is no training data.
         if self.random_detection:
-            return random.choice(["A", "D"])
+            result = random.choice(["A", "D"])
+            return (result, None) if return_score else result
 
+        # If not trained, default to non-anomalous ("D")
         if not self.trained:
-            return "D"
+            return ("D", None) if return_score else "D"
 
         point = np.array([from_device, to_device]).reshape(1, -1)
         prediction = self.model.predict(point)
-        return "A" if prediction == -1 else "D"
+        result = "A" if prediction == -1 else "D"
 
-    def batch_predict(self, log_points):
-        if not log_points:
-            return []
-
-        if self.random_detection:
-            return [random.choice(["A", "D"]) for _ in log_points]
-
-        if not self.trained:
-            return ["D" for _ in log_points]
-
-        points = np.array(log_points)
-        if points.ndim == 1:
-            points = points.reshape(1, -1)
-        predictions = self.model.predict(points)
-        return ["A" if pred == -1 else "D" for pred in predictions]
-
-    def evaluate(self, test_logs):
-        X_test = [[log["from_device"], log["to_device"]] for log in test_logs]
-        y_true = [1 if log["kind"] == "A" else 0 for log in test_logs]  # Assume "A" is the anomaly class
-        y_pred = [1 if self.model.predict([x])[0] == -1 else 0 for x in X_test]
-
-        accuracy = accuracy_score(y_true, y_pred)
-        precision = precision_score(y_true, y_pred)
-        recall = recall_score(y_true, y_pred)
-        f1 = f1_score(y_true, y_pred)
-
-        return {
-            "accuracy": accuracy,
-            "precision": precision,
-            "recall": recall,
-            "f1_score": f1
-        }
-    def __init__(self, contamination=0.1):
-        self.model = IsolationForest(contamination=contamination, n_estimators=1)
-        self.trained = False
-        self.random_detection = False
-
-    def train(self, logs=None):
-        if logs is None or len(logs) == 0:
-            # Initialize random detection logic
-            self.random_detection = True
-            print("Using random detection due to insufficient training data.")
-        else:
-            X = [[log["from_device"], log["to_device"]] for log in logs]
-            self.model.fit(X)
-            self.trained = True
-            self.random_detection = False
-
-    def predict(self, from_device, to_device):
-        if self.random_detection:
-            return random.choice(["A", "D"])
-
-        if not self.trained:
-            return "D"
-
-        point = np.array([from_device, to_device]).reshape(1, -1)
-        prediction = self.model.predict(point)
-        return "A" if prediction == -1 else "D"
+        if return_score:
+            # Get anomaly score: lower scores indicate higher anomaly likelihood.
+            score = self.model.decision_function(point)
+            # score_samples returns an array; extract the first element.
+            return result, score[0]
+        return result
 
     def batch_predict(self, log_points):
         if self.random_detection:
