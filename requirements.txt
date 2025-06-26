@@ -1,0 +1,11 @@
+gym
+matplotlib
+imageio
+python-igraph
+numpy
+pandas
+scikit-learn
+torch
+tqdm
+nashpy
+scipy
