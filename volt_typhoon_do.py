@@ -851,7 +851,7 @@ if __name__ == "__main__":
     parser.add_argument('--output_dir', type=str, default='plots', help='Where to save per-iteration and final plots')
     parser.add_argument('--experiment_num', type=int, default=0, help='experiment type')
     parser.add_argument('--experiment_all',action='store_true',help='Do all experiments at once')
-    parser.add_argument('--do_DO',action='store_true',help='Do DO (vs loading from policy)')
+    parser.add_argument('--do_DOAR',action='store_true',help='Do DO (vs loading from policy)')
     parser.add_argument('--min_DO_iters', type=int, default=1, help='minimum number of DO rounds')
     parser.add_argument('--seed', type=int, default=1, help='random seed')
     parser.add_argument('--its', type=int, default=1, help='instance of network')
@@ -880,7 +880,7 @@ if __name__ == "__main__":
     steps = args.steps_per_episode
     num_dev = args.num_of_device
     output = args.output_dir
-    do_DO = args.do_DO
+    do_DO = args.do_DOAR
     min_DO_iters = args.min_DO_iters
     fixed_test_eps_length = args.fixed_test_eps_length
     experiment_num = args.experiment_num
