@@ -1,6 +1,7 @@
 # CyGym
 
 A **Cybersecurity Simulation Environment for Game-Theoretic Analysis**, accepted to GameSec 2025.
+https://arxiv.org/abs/2506.21688
 
 ---
 
