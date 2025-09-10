@@ -14,6 +14,7 @@ import torch.nn.utils as utils
 import warnings
 import math
 from typing import Optional, Dict, List, Tuple
+
 from volt_typhoon_env import Volt_Typhoon_CyberDefenseEnv
 
 class ReplayBuffer:
@@ -95,6 +96,9 @@ class CommitteeStrategy:
                                       action_dim = self.n_types + self.D + self.E + self.A,
                                       seed       = self.seed,
                                       device     = self.device)
+
+
+                           
             critic = strat.load_critic(Critic,
                                        state_dim  = state.shape[0],
                                        action_dim = self.n_types + self.D + self.E + self.A,
@@ -269,22 +273,89 @@ class Strategy:
     def average_payoff(self):
         return float(np.mean(self.payoffs)) if self.payoffs else 0.0
 
-    def load_actor(self, ActorClass, state_dim, action_dim, seed, device):
+    def load_actor(self,
+                   ActorClass: Type[nn.Module],
+                   *args,
+                   seed: Optional[int] = None,
+                   device: Optional[torch.device] = None) -> Optional[nn.Module]:
+        """
+        Rebuild exactly the same Actor that was saved, inferring its
+        input‐ and output‐sizes from either actor_dims or the checkpoint itself.
+        """
         if self.actor_state_dict is None:
             return None
-        actor = ActorClass(state_dim, action_dim, seed, device)
-        actor.load_state_dict(self.actor_state_dict)
-        actor.to(device).eval()
-        return actor
 
-    def load_critic(self, CriticClass, state_dim, action_dim, seed, device):
+        # 1) If we recorded the true dimensions at save time, trust those:
+        if getattr(self, 'actor_dims', None):
+            state_dim, action_dim = self.actor_dims
+            logging.debug(f"[DEBUG] using recorded actor_dims: in={state_dim}, out={action_dim}")
+        else:
+            # 2) Otherwise peek at the checkpoint
+            #    fc1.weight: [hidden, input_dim]
+            #    fc3.weight: [output_dim, hidden]
+            w1 = self.actor_state_dict['fc1.weight']
+            w3 = self.actor_state_dict['fc3.weight']
+            hidden, state_dim = w1.shape
+            action_dim, _     = w3.shape
+            logging.debug(f"[DEBUG] inferred actor_dims from ckpt: in={state_dim}, out={action_dim}")
+
+        # 3) Rebuild the network and load weights
+        actor = ActorClass(state_dim, action_dim, seed, device)
+        try:
+            actor.load_state_dict(self.actor_state_dict)
+        except RuntimeError as e:
+            logging.error(f"[ERROR] Actor.load_state_dict failed: {e}")
+            raise
+
+        return actor.to(device).eval()
+
+
+    def load_critic(self, CriticClass, *args, seed=None, device=None):
+        """
+        Rebuild exactly the same Critic that was saved, inferring its
+        input dimensions from the checkpoint itself, and trusting
+        actor_dims for the correct state vs. action split.
+        """
         if self.critic_state_dict is None:
             return None
-        critic = CriticClass(state_dim, action_dim, seed, device)
-        critic.load_state_dict(self.critic_state_dict)
-        critic.to(device).eval()
-        return critic
 
+        # 1) Peek at the checkpoint shape:
+        w1 = self.critic_state_dict['fc1.weight']        # shape [hidden, total_in]
+        hidden, total_in = w1.shape
+        logging.debug(f"[DEBUG] checkpoint fc1.weight shape: {w1.shape}")
+
+        # 2) Figure out (state_dim, action_dim)
+        if getattr(self, 'actor_dims', None):
+            # we recorded the correct split at save time
+            state_dim, action_dim = self.actor_dims
+            if state_dim + action_dim != total_in:
+                logging.warning(
+                    f"[WARN] actor_dims sum {state_dim}+{action_dim} != total_in {total_in}; "
+                    "overriding from checkpoint"
+                )
+                # override anyway
+                action_dim = total_in - state_dim
+        else:
+            # no actor_dims: split evenly (last‐ditch fallback)
+            state_dim = total_in // 2
+            action_dim = total_in - state_dim
+            logging.warning(
+                f"[WARN] no actor_dims on this Strategy; inferring state_dim={state_dim}, "
+                f"action_dim={action_dim}"
+            )
+
+        logging.debug(
+            f"[DEBUG] Rebuilding Critic with state_dim={state_dim}, action_dim={action_dim}"
+        )
+
+        # 3) Reconstruct & load
+        critic = CriticClass(state_dim, action_dim, seed, device)
+        try:
+            critic.load_state_dict(self.critic_state_dict)
+        except RuntimeError as e:
+            logging.error(f"[ERROR] load_state_dict failed: {e}")
+            raise
+        return critic.to(device).eval()
 
     def __repr__(self):
         kind = "Parametric" if self.is_parametric() else "Fixed"
@@ -335,6 +406,8 @@ class DoubleOracle:
         self.defender_equilibrium = None
         self.attacker_equilibrium = None
 
+        self.merge_rule_atype = "best_q"
+
         # ── NOW initialize the DDPG structures ────────────────────────────
         defender_state_dim = self.env._get_defender_state().shape[0]
         attacker_state_dim = self.env._get_attacker_state().shape[0]
@@ -373,9 +446,50 @@ class DoubleOracle:
         self.saved_attacker_critics.append(
             copy.deepcopy(self.attacker_ddpg['critic'].state_dict())
         )
+        self.checkpoint = None  # <- in-memory only
 
 
+    # -------- In-memory checkpoint (no disk) ----------------------
+    def checkpoint_now(self):
+        """
+        Capture a deep-copied snapshot of the *current* env state into
+        self.checkpoint. Nothing is written to disk.
+        """
+        if getattr(self.env, "simulator", None) is None or getattr(self.env, "state", None) is None:
+            raise RuntimeError("DoubleOracle.checkpoint_now(): env not initialized (simulator/state missing).")
+        self.checkpoint = {
+            'simulator': copy.deepcopy(self.env.simulator),
+            'state':     copy.deepcopy(self.env.state),
+            'mode':      self.env.mode,
+        }
 
+    def restore(self, env_obj=None, *, reset_counters: bool = True) -> bool:
+        """
+        Restore the snapshot into env_obj (default: self.env). Returns True if restored.
+        Nothing touches disk.
+        """
+        if not getattr(self, "checkpoint", None):
+            return False
+        tgt = env_obj or self.env
+        tgt.simulator = copy.deepcopy(self.checkpoint['simulator'])
+        tgt.state     = copy.deepcopy(self.checkpoint['state'])
+        if 'mode' in self.checkpoint:
+            tgt.mode = self.checkpoint['mode']
+        if reset_counters:
+            for attr in [
+                "step_num", "defender_step", "attacker_step", "work_done",
+                "checkpoint_count", "defensive_cost", "clearning_cost",
+                "revert_count", "scan_cnt", "compromised_devices_cnt",
+                "edges_blocked", "edges_added"
+            ]:
+                if hasattr(tgt, attr):
+                    setattr(tgt, attr, 0)
+        return True
+
+    def fresh_env(self):
+        env_copy = copy.deepcopy(self.env)
+        self.restore(env_copy, reset_counters=True)
+        return env_copy
 
     def decode_action(
         self,
@@ -390,6 +504,13 @@ class DoubleOracle:
         critic: nn.Module = None,
         exploit_override: Optional[int] = None
     ):
+
+        # ── ENSURE WE ALWAYS USE THE ORIGINAL D, E, A THAT THE NETWORKS WERE BUILT WITH ──
+        orig_D, orig_E, orig_A = self.D_init, self.E_init, self.A_init
+        if (num_device_indices, num_exploit_indices, num_app_indices) != (orig_D, orig_E, orig_A):
+            num_device_indices, num_exploit_indices, num_app_indices = orig_D, orig_E, orig_A
+
+
         """
         Decode a continuous action_vector into a discrete tuple:
         (action_type, exploit_indices, device_indices, app_index)
@@ -1031,17 +1152,7 @@ class DoubleOracle:
         
         '''
 
-        with open(self.env.snapshot_path, 'rb') as f:
-            loaded = pickle.load(f)
-
-        if isinstance(loaded, Volt_Typhoon_CyberDefenseEnv):
-            # snapshot was the whole env
-            env_copy = copy.deepcopy(loaded)
-        else:
-            # snapshot was the dict {simulator,state}
-            env_copy = copy.deepcopy(self.env)
-            env_copy.simulator = loaded['simulator']
-            env_copy.state     = loaded['state']
+        env_copy = self.fresh_env()
         env_copy.randomize_compromise_and_ownership()
         env_copy.step_num = env_copy.defender_step = env_copy.attacker_step = 0
         env_copy.work_done = 0
@@ -1132,6 +1243,7 @@ class DoubleOracle:
                     break
 
             else:
+
                 # --- opponent’s turn: sample from equilibrium mix ---
                 idx   = np.random.choice(len(opponent_strategies), p=opponent_equilibrium)
                 strat = opponent_strategies[idx]
@@ -1142,22 +1254,33 @@ class DoubleOracle:
                 elif strat.actions is not None:
                     action = strat.actions[t % len(strat.actions)]
                 else:
-                    # rebuild opponent net
+                    
+                    # ── opponent’s turn: rebuild actor+critic directly from checkpoint ──
                     st = (env_copy._get_defender_state() if turn=='defender'
                         else env_copy._get_attacker_state())
-                    n_t = (self.n_def_types if turn=='defender'
-                        else self.n_att_types)
-                    actor_model  = strat.load_actor(Actor,  st.shape[0], n_t+D+E+A, self.seed, self.device)
-                    critic_model = strat.load_critic(Critic, st.shape[0], n_t+D+E+A, self.seed, self.device)
-                    st_tensor = torch.tensor(st, dtype=torch.float32).unsqueeze(0).to(self.device)
+                    s_tensor = torch.tensor(st, dtype=torch.float32).unsqueeze(0).to(self.device)
+
+                    # always load exact dims from the saved checkpoint
+                    actor  = strat.load_actor(Actor,  seed=self.seed, device=self.device)
+                    critic = strat.load_critic(Critic, seed=self.seed, device=self.device)
+
+                    # get raw continuous proposal
                     with torch.no_grad():
-                        raw_vec = actor_model(st_tensor).cpu().numpy()[0]
+                        raw_vec = actor(s_tensor).cpu().numpy()[0]
+
+                    # discrete decode (with coordination ascent or fallback)
                     action = self.decode_action(
-                        raw_vec, n_t, D, E, A,
-                        state_tensor=st_tensor,
-                        actor=actor_model,
-                        critic=critic_model
+                        raw_vec,
+                        num_action_types    = (self.n_def_types if turn=='defender'
+                                            else self.n_att_types),
+                        num_device_indices  = self.D_init,
+                        num_exploit_indices = self.E_init,
+                        num_app_indices     = self.A_init,
+                        state_tensor        = s_tensor,
+                        actor               = actor,
+                        critic              = critic
                     )
+
 
                 _, _, done, *_ = env_copy.step(action)
                 state = my_state_fn() if role != turn else other_state_fn()
@@ -1222,6 +1345,11 @@ class DoubleOracle:
            avg_edges_blocked,
            avg_edges_added)
         """
+        import copy, random, pickle, torch
+        from hierarchical_br import HierarchicalBestResponse
+        from volt_typhoon_env import Volt_Typhoon_CyberDefenseEnv
+        from meta_hierarchical_br import MetaHierarchicalBestResponse
+
         # Accumulators
         total_def            = 0.0
         total_att            = 0.0
@@ -1237,160 +1365,143 @@ class DoubleOracle:
         # Build zero-day draws & their priors
         if self.env.zero_day:
             pool_ids = list(self.env.private_exploit_ids) or [None]
-            probs = [ self.env.prior_pi.get(z, 1.0) if z is not None else 1.0
-                      for z in pool_ids ]
+            probs = [
+                self.env.prior_pi.get(z, 1.0) if z is not None else 1.0
+                for z in pool_ids
+            ]
             total_p = sum(probs)
-            probs = [ p/total_p for p in probs ]
+            probs = [p / total_p for p in probs]
         else:
             pool_ids = [None]
             probs    = [1.0]
 
-        # Total number of episodes we will effectively run
+        N = num_simulations
 
-        N =   num_simulations
-
-        if self.zero_day:
-
-            # For each zdraw
+        # zero-day branch
+        if self.env.zero_day:
             for idx_z, zdraw in enumerate(pool_ids):
                 weight_z = probs[idx_z]
-
-
-
-
                 for _ in range(num_simulations):
-                    # --- reset a fresh copy ---
+                    # reset a fresh copy
                     env_copy = copy.deepcopy(self.env)
                     env_copy.reset(from_init=True)
 
-
-                    indices = random.sample(range(len(self.env.simulator.exploits)), self.env.preknown)
-                    for exp in self.env.simulator.exploits:
+                    # mark pre-known exploits
+                    indices = random.sample(
+                        range(len(env_copy.simulator.exploits)),
+                        env_copy.preknown
+                    )
+                    for exp in env_copy.simulator.exploits:
                         exp.discovered = False
-                    for idx in indices:
-                        exp = self.env.simulator.exploits[idx]
-                        exp.discovered = True
-
+                    for i in indices:
+                        env_copy.simulator.exploits[i].discovered = True
 
                     env_copy.randomize_compromise_and_ownership()
-                    env_copy.step_num = env_copy.defender_step = env_copy.attacker_step = 0
-                    env_copy.work_done = 0
-                    env_copy.checkpoint_count = 0
-                    env_copy.defensive_cost   = 0
-                    env_copy.clearning_cost   = 0
-                    env_copy.revert_count     = 0
-                    env_copy.scan_cnt         = 0
-                    env_copy.compromised_devices_cnt = 0
-                    env_copy.edges_blocked           = 0
-                    env_copy.edges_added             = 0
+                    # zero-out all counters
+                    for attr in [
+                        "step_num", "defender_step", "attacker_step",
+                        "work_done", "checkpoint_count", "defensive_cost",
+                        "clearning_cost", "revert_count", "scan_cnt",
+                        "compromised_devices_cnt", "edges_blocked",
+                        "edges_added"
+                    ]:
+                        setattr(env_copy, attr, 0)
 
-                    # fix z if zero-day
-                    if zdraw is not None:
-                        env_copy.private_exploit_id = zdraw
-                    else:
-                        env_copy.private_exploit_id = None
+                    # fix this zero-day draw
+                    env_copy.private_exploit_id = zdraw
 
-                    # per-episode split trackers
-                    discovered   = False
-                    phase1_def   = phase2_def   = 0.0
-                    phase1_att   = phase2_att   = 0.0
-
+                    discovered = False
+                    phase1_def = phase2_def = 0.0
+                    phase1_att = phase2_att = 0.0
                     final_info = {}
 
-                    # --- run exactly self.steps_per_episode steps ---
                     for t in range(self.steps_per_episode):
-                        turn = 'defender' if (t % 2 == 0) else 'attacker'
-                        env_copy.mode = turn
+                        turn = 'defender' if (t%2==0) else 'attacker'
+                        strat = (defender_strategy if turn=='defender' else attacker_strategy)
 
-                        # pick the right strategy
-                        strat = defender_strategy if turn=='defender' else attacker_strategy
-
-                        # (A) baseline or fixed sequence?
-                        if strat.baseline_name and strat.baseline_name.lower()!='randominit':
-                            env_copy.base_line = strat.baseline_name
+                        # (A) baseline
+                        if strat.baseline_name:
                             action = None
 
+                        # (B) meta-hierarchical
+                        elif strat.type_mapping and 'meta' in strat.type_mapping:
+                            state_vec = (env_copy._get_defender_state() if turn=='defender'
+                                        else env_copy._get_attacker_state())
+                            action = MetaHierarchicalBestResponse(self, turn).execute(strat, state_vec)
 
-                        # (B) exploit‐committee
-                        elif getattr(strat, 'type_mapping', None) and 'committee' in strat.type_mapping:
-                            # call our new CommitteeStrategy
-                            action = strat.type_mapping['committee'].select_action()
-                        # (C) fixed‐sequence
+                        # (C) hierarchical (old two-level)
+                        elif strat.type_mapping and 'hierarchical' in strat.type_mapping:
+                            state_vec = (env_copy._get_defender_state() if turn=='defender'
+                                        else env_copy._get_attacker_state())
+                            action = HierarchicalBestResponse(self, turn).execute(strat, state_vec)
+
+                        # (C) committee …
+                        elif strat.type_mapping and 'committee' in strat.type_mapping:
+                            action = strat.type_mapping['committee'].select_action(state_vec)
+
+                        elif strat.type_mapping and ('ippo' in strat.type_mapping or 'mappo' in strat.type_mapping or 'marl' in strat.type_mapping):
+                            state_vec = env_copy._get_defender_state() if turn == 'defender' else env_copy._get_attacker_state()
+                            agent = (strat.type_mapping.get('ippo') or
+                                    strat.type_mapping.get('mappo') or
+                                    strat.type_mapping.get('marl'))
+                            action = agent.select_action(state_vec, env=env_copy)
+
+                        # (D) fixed-sequence …
                         elif strat.actions is not None:
                             action = strat.actions[t % len(strat.actions)]
+
+                        # (E) now finally the parametric Actor–Critic
                         else:
-                            # (B) parametric actor→critic decode
-                            if turn=='defender':
-                                st = env_copy._get_defender_state()
-                                n_types = env_copy.get_num_action_types(mode='defender')
-                            else:
-                                st = env_copy._get_attacker_state()
-                                n_types = env_copy.get_num_action_types(mode='attacker')
-
-                            D = env_copy.Max_network_size
-                            E = env_copy.MaxExploits
-                            A = env_copy.get_num_app_indices()
-
-                            st_tensor = torch.tensor(st, dtype=torch.float32)\
-                                            .unsqueeze(0).to(self.device)
-                            actor_model  = strat.load_actor(
-                                Actor, st.shape[0], n_types+D+E+A, self.seed, self.device
-                            )
-                            critic_model = strat.load_critic(
-                                Critic, st.shape[0], n_types+D+E+A, self.seed, self.device
-                            )
+                            st = (env_copy._get_defender_state() if turn=='defender'
+                                else env_copy._get_attacker_state())
+                            s_tensor = torch.tensor(st, dtype=torch.float32,
+                                                    device=self.device).unsqueeze(0)
+                            actor_model  = strat.load_actor(Actor, seed=self.seed, device=self.device)
+                            critic_model = strat.load_critic(Critic, seed=self.seed, device=self.device)
                             with torch.no_grad():
-                                raw_vec = actor_model(st_tensor).cpu().numpy()[0]
+                                raw_vec = actor_model(s_tensor).cpu().numpy()[0]
                             action = self.decode_action(
                                 raw_vec,
-                                num_action_types    = n_types,
-                                num_device_indices  = D,
-                                num_exploit_indices = E,
-                                num_app_indices     = A,
-                                state_tensor        = st_tensor,
+                                num_action_types    = (self.n_def_types if turn=='defender'
+                                                        else self.n_att_types),
+                                num_device_indices  = self.D_init,
+                                num_exploit_indices = self.E_init,
+                                num_app_indices     = self.A_init,
+                                state_tensor        = s_tensor,
                                 actor               = actor_model,
                                 critic              = critic_model
                             )
 
+
+
                         # step
                         _, r, _, done, info, _ = env_copy.step(action)
 
-                        # allocate reward into phase1 or phase2
-                        if self.env.zero_day:
-                            # check if defender has discovered the true exploit
-                            if turn=='defender' and info.get('discovered_private', False):
-                                discovered = True
-
-                            if turn=='defender':
-                                if not discovered:
-                                    phase1_def += r
-                                else:
-                                    phase2_def += r
-                            else:
-                                if not discovered:
-                                    phase1_att += r
-                                else:
-                                    phase2_att += r
-                        else:
-                            # no zero-day → just treat all as phase1
-                            if turn=='defender':
+                        # allocate reward split
+                        if info.get('discovered_private', False) and turn=='defender':
+                            discovered = True
+                        if turn == 'defender':
+                            if not discovered:
                                 phase1_def += r
                             else:
+                                phase2_def += r
+                        else:
+                            if not discovered:
                                 phase1_att += r
+                            else:
+                                phase2_att += r
 
                         if done:
                             final_info = info
                             break
                     else:
-                        # if we never broke early, capture last info
                         final_info = info
 
-                    # --- accumulate weighted payoffs ---
-                    # defender: prior-weighted phase1 + full-weight phase2
+                    # accumulate weighted payoffs
                     total_def += weight_z * phase1_def + phase2_def
                     total_att += weight_z * phase1_att + phase2_att
 
-                    # and all the side‐metrics just get prior-weighted
+                    # accumulate side-metrics
                     total_compromised    += final_info.get("Compromised_devices", 0.0) * weight_z
                     total_jobs_completed += final_info.get("work_done",           0.0) * weight_z
                     total_scan_cnt       += final_info.get("Scan_count",          0.0) * weight_z
@@ -1399,91 +1510,83 @@ class DoubleOracle:
                     total_revert_cnt     += final_info.get("revert_count",        0.0) * weight_z
                     total_edges_blocked  += final_info.get("Edges Blocked",       0.0) * weight_z
                     total_edges_added    += final_info.get("Edges Added",         0.0) * weight_z
+
+        # non–zero-day branch
         else:
-           
             for _ in range(num_simulations):
-                # --- reset a fresh copy ---
-                with open(self.env.snapshot_path, 'rb') as f:
-                    loaded = pickle.load(f)
-
-                if isinstance(loaded, Volt_Typhoon_CyberDefenseEnv):
-                    # snapshot was the whole env
-                    env_copy = copy.deepcopy(loaded)
-                else:
-                    # snapshot was the dict {simulator,state}
-                    env_copy = copy.deepcopy(self.env)
-                    env_copy.simulator = loaded['simulator']
-                    env_copy.state     = loaded['state']
+                # reload snapshot
+                env_copy = self.fresh_env()
                 env_copy.randomize_compromise_and_ownership()
-                env_copy.step_num = env_copy.defender_step = env_copy.attacker_step = 0
-                env_copy.work_done = 0
-                env_copy.checkpoint_count = 0
-                env_copy.defensive_cost   = 0
-                env_copy.clearning_cost   = 0
-                env_copy.revert_count     = 0
-                env_copy.scan_cnt         = 0
+                for attr in [
+                    "step_num", "defender_step", "attacker_step",
+                    "work_done", "checkpoint_count",
+                    "defensive_cost", "clearning_cost",
+                    "revert_count", "scan_cnt"
+                ]:
+                    setattr(env_copy, attr, 0)
 
-
-
-                def_r   = att_r   = 0.0
-
-
+                def_r = att_r = 0.0
                 final_info = {}
 
-                # --- run exactly self.steps_per_episode steps ---
                 for t in range(self.steps_per_episode):
-                    turn = 'defender' if (t % 2 == 0) else 'attacker'
-                    env_copy.mode = turn
+                    turn = 'defender' if (t%2==0) else 'attacker'
+                    strat = (defender_strategy if turn=='defender' else attacker_strategy)
 
-                    # pick the right strategy
-                    strat = defender_strategy if turn=='defender' else attacker_strategy
-
-                    # (A) baseline or fixed sequence?
-                    if strat.baseline_name and strat.baseline_name.lower()!='randominit':
-                        env_copy.base_line = strat.baseline_name
+                    # (A) baseline
+                    if strat.baseline_name:
                         action = None
+
+                    # (B) meta-hierarchical
+                    elif strat.type_mapping and 'meta' in strat.type_mapping:
+                        state_vec = (env_copy._get_defender_state() if turn=='defender'
+                                    else env_copy._get_attacker_state())
+                        action = MetaHierarchicalBestResponse(self, turn).execute(strat, state_vec)
+
+                    # (C) hierarchical (old two-level)
+                    elif strat.type_mapping and 'hierarchical' in strat.type_mapping:
+                        state_vec = (env_copy._get_defender_state() if turn=='defender'
+                                    else env_copy._get_attacker_state())
+                        action = HierarchicalBestResponse(self, turn).execute(strat, state_vec)
+
+                    # (C) committee …
+                    elif strat.type_mapping and 'committee' in strat.type_mapping:
+                        action = strat.type_mapping['committee'].select_action(state_vec)
+                        
+                    #  MARL / MAPPO / IPPO (if present)
+                    elif strat.type_mapping and ('ippo' in strat.type_mapping or 'mappo' in strat.type_mapping or 'marl' in strat.type_mapping):
+                        state_vec = env_copy._get_defender_state() if turn == 'defender' else env_copy._get_attacker_state()
+                        agent = (strat.type_mapping.get('ippo') or
+                                strat.type_mapping.get('mappo') or
+                                strat.type_mapping.get('marl'))
+                        action = agent.select_action(state_vec, env=env_copy)
+                    # (D) fixed-sequence …
                     elif strat.actions is not None:
                         action = strat.actions[t % len(strat.actions)]
+
+                    # (E) now finally the parametric Actor–Critic
                     else:
-                        # (B) parametric actor→critic decode
-                        if turn=='defender':
-                            st = env_copy._get_defender_state()
-                            n_types = env_copy.get_num_action_types(mode='defender')
-                        else:
-                            st = env_copy._get_attacker_state()
-                            n_types = env_copy.get_num_action_types(mode='attacker')
-
-                        D = env_copy.Max_network_size
-                        E = env_copy.MaxExploits
-                        A = env_copy.get_num_app_indices()
-
-                        st_tensor = torch.tensor(st, dtype=torch.float32)\
-                                        .unsqueeze(0).to(self.device)
-                        actor_model  = strat.load_actor(
-                            Actor, st.shape[0], n_types+D+E+A, self.seed, self.device
-                        )
-                        critic_model = strat.load_critic(
-                            Critic, st.shape[0], n_types+D+E+A, self.seed, self.device
-                        )
+                        st = (env_copy._get_defender_state() if turn=='defender'
+                            else env_copy._get_attacker_state())
+                        s_tensor = torch.tensor(st, dtype=torch.float32,
+                                                device=self.device).unsqueeze(0)
+                        actor_model  = strat.load_actor(Actor, seed=self.seed, device=self.device)
+                        critic_model = strat.load_critic(Critic, seed=self.seed, device=self.device)
                         with torch.no_grad():
-                            raw_vec = actor_model(st_tensor).cpu().numpy()[0]
+                            raw_vec = actor_model(s_tensor).cpu().numpy()[0]
                         action = self.decode_action(
                             raw_vec,
-                            num_action_types    = n_types,
-                            num_device_indices  = D,
-                            num_exploit_indices = E,
-                            num_app_indices     = A,
-                            state_tensor        = st_tensor,
+                            num_action_types    = (self.n_def_types if turn=='defender'
+                                                    else self.n_att_types),
+                            num_device_indices  = self.D_init,
+                            num_exploit_indices = self.E_init,
+                            num_app_indices     = self.A_init,
+                            state_tensor        = s_tensor,
                             actor               = actor_model,
                             critic              = critic_model
                         )
-
-                    # step
                     _, r, _, done, info, _ = env_copy.step(action)
 
-                    
-                    # no zero-day → just treat all as phase1
-                    if turn=='defender':
+                    if turn == 'defender':
                         def_r += r
                     else:
                         att_r += r
@@ -1492,27 +1595,23 @@ class DoubleOracle:
                         final_info = info
                         break
                 else:
-                    # if we never broke early, capture last info
                     final_info = info
-
 
                 total_def += def_r
                 total_att += att_r
 
-                # and all the side‐metrics just get prior-weighted
-                total_compromised    += final_info.get("Compromised_devices", 0.0) 
-                total_jobs_completed += final_info.get("work_done",           0.0) 
-                total_scan_cnt       += final_info.get("Scan_count",          0.0) 
-                total_defensive_cost += final_info.get("defensive_cost",      0.0) 
-                total_checkpoint_cnt += final_info.get("checkpoint_count",    0.0) 
-                total_revert_cnt     += final_info.get("revert_count",        0.0) 
-                total_edges_blocked  += final_info.get("Edges Blocked",       0.0) 
-                total_edges_added    += final_info.get("Edges Added",         0.0) 
+                total_compromised    += final_info.get("Compromised_devices", 0.0)
+                total_jobs_completed += final_info.get("work_done",           0.0)
+                total_scan_cnt       += final_info.get("Scan_count",          0.0)
+                total_defensive_cost += final_info.get("defensive_cost",      0.0)
+                total_checkpoint_cnt += final_info.get("checkpoint_count",    0.0)
+                total_revert_cnt     += final_info.get("revert_count",        0.0)
+                total_edges_blocked  += final_info.get("Edges Blocked",       0.0)
+                total_edges_added    += final_info.get("Edges Added",         0.0)
 
-        # --- compute averages ---
+        # compute averages
         avg_compromised_fraction = 0.0
         if N > 0:
-            # normalize by number of steps to get a fraction
             last_steps = env_copy.step_num or self.steps_per_episode
             avg_compromised_fraction = (total_compromised / N) / last_steps
 
@@ -1528,6 +1627,7 @@ class DoubleOracle:
             total_edges_blocked  / N,
             total_edges_added    / N
         )
+
 
 
 
@@ -1639,11 +1739,31 @@ class DoubleOracle:
         # ── 5) merge per‐device picks, ensure one exploit slot ───────
         final_atype = no_op_type
         devs, exps = [], []
-        for (at, ds, es, _) in best_map.values():
-            if at != no_op_type:
-                final_atype = at
-                devs.extend(ds.tolist())
-                exps.extend(es.tolist())
+
+        if self.merge_rule_atype == "best_q":
+            # Paper-correct merge (Algorithm 1 erratum):
+            # Pick action type from the device whose sampled a_d has the highest Qϕ(s, a_d).
+            # This change is order-independent and matches the text:
+            #     t* = argmax_d Qϕ(s, a_d)
+            scored = []
+            for d, (at, ds, es, p) in best_map.items():
+                qd = Q_of((at, ds, es, p))[0]
+                scored.append((qd, at, ds, es, p))
+                if at != no_op_type:
+                    devs.extend(ds.tolist()); exps.extend(es.tolist())
+
+            non_noop = [row for row in scored if row[1] != no_op_type]
+            final_atype = (max(non_noop, key=lambda r: r[0])[1] if non_noop else no_op_type)
+
+        else:
+            # Historical merge (used in all published results; kept for reproducibility):
+            # "last non-noop wins" — order-dependent but empirically adequate vs fixed opponents.
+            # See paper erratum: Algorithm 1 now states t* = argmax_d Qϕ(s, a_d).
+            for (at, ds, es, _) in best_map.values():
+                if at != no_op_type:
+                    final_atype = at
+                    devs.extend(ds.tolist())
+                    exps.extend(es.tolist())
 
         final_devs = np.array(devs, dtype=int) if devs else np.array([], dtype=int)
 
@@ -1675,10 +1795,9 @@ class DoubleOracle:
             List of tuples [(def_rewards, att_rewards), ...] per run.
         """
         # 1) restore the one‐true network snapshot
-        with open("initial_net_DO.pkl", "rb") as f:
-            snap = pickle.load(f)
-        saved_sim   = snap["simulator"]
-        saved_state = snap["state"]
+        ok = self.restore(self.env, reset_counters=True)
+        if not ok:
+            raise RuntimeError("No in-memory checkpoint set. Call do.checkpoint_now() first.")
 
         # 2) precompute dims for actor instantiation & decoding
         D = self.env.Max_network_size
@@ -1707,9 +1826,13 @@ class DoubleOracle:
 
             idx_fixed = np.random.choice(len(strat_pool), p=probs)
             fixed_strat = strat_pool[idx_fixed]
-            # instantiate its Actor net
-            fixed_actor = fixed_strat.load_actor(
-                Actor, state_dim, action_dim, self.seed, self.device
+
+            # instantiate its Actor & Critic nets
+            fixed_actor  = fixed_strat.load_actor(
+                Actor, seed=self.seed, device=self.device
+            )
+            fixed_critic = fixed_strat.load_critic(
+                Critic, seed=self.seed, device=self.device
             )
 
             # 4) restore the env to the same snapshot
@@ -1736,11 +1859,24 @@ class DoubleOracle:
                         st = self.env._get_attacker_state()
                         n_types, s_dim = att_types, att_state_dim
 
-                    with torch.no_grad():
-                        vec = fixed_actor(
-                            torch.tensor(st, dtype=torch.float32)
-                                .unsqueeze(0)
-                                .to(self.device)
+                        with torch.no_grad():
+                            vec = fixed_actor(
+                                torch.tensor(st, dtype=torch.float32)
+                                      .unsqueeze(0)
+                                      .to(self.device)
+                            )
+                        av = vec.cpu().numpy()[0]
+                        action = self.decode_action(
+                            av,
+                            num_action_types    = n_types,
+                            num_device_indices  = D,
+                            num_exploit_indices = E,
+                            num_app_indices     = A,
+                            state_tensor        = torch.tensor(st, dtype=torch.float32)
+                                                       .unsqueeze(0)
+                                                       .to(self.device),
+                            actor               = fixed_actor,
+                            critic              = fixed_critic
                         )
                     av = vec.cpu().numpy()[0]
                     action = self.decode_action(av, n_types, D, E, A)
