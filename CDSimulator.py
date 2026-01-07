@@ -13,19 +13,6 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 import uuid
 from CDSimulatorComponents import *
 import pandas as pd
-# class CyberDefenseSimulator:
-
-# App: Id, type, vulneralbility, version
-# OS: Id, type, vulnerabilities, version
-# Device: Id, OS, {app}, address, isCompromised, Workload
-# Subnet: set of devices
-# network: set of subnet
-# exploit: vulnerability, OS, app
-# workflow: source, test, size(# of steps)
-# Vulnerability
-
-# class CyberDefenseSimulator
-
 
 class CyberDefenseSimulator:
     """
@@ -39,9 +26,8 @@ class CyberDefenseSimulator:
         self.apps = set()
         self.logger = Logger()
         self.system_time = 0
-        self.detector= Detector()
+        self.detector = Detector()
         self.vulneralbilities = set()
-        #self.exploits = set()
         self.exploits = []
         self.defaultOS = OperatingSystem(0, "OS", 1.0)
         self.defaultversion = 1
@@ -49,159 +35,378 @@ class CyberDefenseSimulator:
         self.defaulVul = Vulnerability(0, "unknown", self.defaultApp)
         self.df = pd.read_csv('CVE.csv')  # Load CSV into DataFrame
 
+        # Fast mapping from vertex name -> igraph index (keeps igraph lookups O(1))
+        # This map is kept up-to-date lazily; call build/update methods when you mutate the graph.
+        self._vertex_name_to_index = {}
+        self._build_vertex_name_index_map()
+
+    # -------------------------
+    # Vertex name <-> index cache helpers
+    # -------------------------
+    def _build_vertex_name_index_map(self):
+        """Build full mapping name -> index for the current graph (safe to call after graph creation/mutation)."""
+        try:
+            g = getattr(self.subnet, "graph", None)
+            if g is None:
+                self._vertex_name_to_index = {}
+                return
+            mapping = {}
+            # iterate vertices once
+            for idx in range(len(g.vs)):
+                try:
+                    name = g.vs[idx]["name"] if "name" in g.vs.attributes() else g.vs[idx].index
+                except Exception:
+                    name = g.vs[idx].index
+                mapping[str(name)] = idx
+            self._vertex_name_to_index = mapping
+        except Exception:
+            # fallback to empty
+            self._vertex_name_to_index = {}
+
+    def _update_vertex_map_for_vertex(self, vertex_index: int):
+        """Add/refresh mapping for a single vertex index."""
+        try:
+            g = getattr(self.subnet, "graph", None)
+            if g is None:
+                return
+            name = g.vs[vertex_index]["name"] if "name" in g.vs.attributes() else g.vs[vertex_index].index
+            self._vertex_name_to_index[str(name)] = vertex_index
+        except Exception:
+            return
+
+    def _get_neighbor_ids(self, device_id):
+        """
+        Return neighbor device 'name' ids for the given device_id (string or number).
+        Uses the cached name->index mapping; if missing attempts an igraph find once and updates the cache.
+        Returns a list (possibly empty) of neighbor ids (strings).
+        """
+        g = getattr(self.subnet, "graph", None)
+        if g is None:
+            return []
+
+        key = str(device_id)
+        idx = self._vertex_name_to_index.get(key, None)
+        if idx is None:
+            # lazy fallback: try to find and add to cache
+            try:
+                v = g.vs.find(name=device_id)
+                idx = v.index
+                self._vertex_name_to_index[key] = idx
+            except Exception:
+                return []
+
+        try:
+            nbr_indices = g.neighbors(idx, mode="out")
+        except Exception:
+            # if igraph fails, return empty
+            return []
+
+        neighbor_ids = []
+        for n in nbr_indices:
+            try:
+                name = g.vs[n]["name"] if "name" in g.vs.attributes() else g.vs[n].index
+                neighbor_ids.append(str(name))
+                # keep cache warm
+                self._vertex_name_to_index[str(name)] = n
+            except Exception:
+                neighbor_ids.append(str(n))
+                self._vertex_name_to_index[str(n)] = n
+        return neighbor_ids
+
+    # -------------------------
+    # Workload assignment (fast path)
+    # -------------------------
+
     def log_communication(self, from_device, to_device, kind):
         self.logger.log(self.system_time, from_device, to_device, kind)
-    
-    def assign_workload(self, workload, wtype=None, adversarial=False):
-        for device_id, device in self.subnet.net.items():
-            # First try to assign the workload to the current device.
-            if (device.OS.id == workload.OS.id and 
-                device.OS.type == workload.OS.type and 
-                device.wtype == workload.wtype and
-                str(device.OS.version) == str(workload.version)):
-                if not device.workload:
-                    device.workload = workload
-                    workload.assigned = True
-                    #print(f"Workload {workload.id} assigned to device {device_id}")
-                    return True
-            else:
-                # If not assigned, try to assign to a neighbor.
+
+    def assign_workload(self,
+                        workload,
+                        wtype=None,
+                        adversarial=False,
+                        preferred_device_id=None,
+                        allow_neighbor_lookup=True,
+                        neighbor_lookup_prob: float = 0.05):
+        """
+        Fast assignment helper with optional neighbor lookup probability.
+
+        Args:
+            workload: Workload object (may have attributes origin_device_id / target_device_id / wtype)
+            wtype: optional override for workload wtype
+            adversarial: mark assigned workload as adversarial if True
+            preferred_device_id: try direct assignment to this device id first (fast O(1))
+            allow_neighbor_lookup: if False, never attempt neighbor fallback
+            neighbor_lookup_prob: probability in [0,1] to perform neighbor lookup when fallback path used
+
+        Returns:
+            True if assigned, False otherwise.
+        """
+        # Helper to test device suitability
+        def _device_matches(dev, w_OS, w_ver, w_wtype):
+            if getattr(dev, "Not_yet_added", False):
+                return False
+            if getattr(dev, "workload", None) is not None:
+                return False
+            if getattr(dev, "busy_time", 0) and dev.busy_time > 0:
+                return False
+            if w_wtype is not None:
+                # client vs server preferences (server devices should be used for server workloads)
+                if w_wtype == 'client' and getattr(dev, "wtype", None) == 'server':
+                    return False
+                if w_wtype == 'server' and getattr(dev, "wtype", None) != 'server':
+                    return False
+            if w_OS is not None:
+                dev_OS = getattr(dev, "OS", None)
+                if dev_OS is None:
+                    return False
+                # match by object id or OS.id if available
+                if dev_OS is not w_OS and getattr(dev_OS, "id", None) != getattr(w_OS, "id", None):
+                    return False
+            if w_ver is not None:
+                if str(getattr(dev, "version", "")).strip() != str(w_ver).strip():
+                    return False
+            return True
+
+        # 1) Try preferred_device_id (fast)
+        if preferred_device_id is not None:
+            dev = self.subnet.net.get(preferred_device_id)
+            if dev is not None:
                 try:
-                    neighbor_ids = self.subnet.graph.get(device_id)  # returns a list of neighbor IDs
+                    w_OS = getattr(workload, "OS", None)
+                    w_ver = getattr(workload, "version", None)
+                    w_wtype = getattr(workload, "wtype", wtype)
                 except Exception:
-                    vertex = self.subnet.graph.vs.find(name=device_id)
-                    neighbor_indices = self.subnet.graph.neighbors(vertex.index, mode="out")
-                    neighbor_ids = [self.subnet.graph.vs[neighbor].attributes()["name"] for neighbor in neighbor_indices]
+                    w_OS = None; w_ver = None; w_wtype = wtype
+                if _device_matches(dev, w_OS, w_ver, w_wtype):
+                    dev.workload = workload
+                    workload.assigned = True
+                    workload.adversarial = bool(adversarial)
+                    return True
 
-                if neighbor_ids is None:
+        # 2) Try explicit target_device_id stored on workload
+        tgid = getattr(workload, "target_device_id", None)
+        if tgid is not None:
+            dev = self.subnet.net.get(tgid)
+            if dev is not None:
+                if _device_matches(dev, getattr(workload, "OS", None), getattr(workload, "version", None), getattr(workload, "wtype", wtype)):
+                    dev.workload = workload
+                    workload.assigned = True
+                    workload.adversarial = bool(adversarial)
+                    return True
+
+        # 3) Try a single-pass neighbor lookup if origin exists and allowed by probability
+        try:
+            w_OS = getattr(workload, "OS", None)
+            w_ver = getattr(workload, "version", None)
+            w_wtype = getattr(workload, "wtype", wtype)
+        except Exception:
+            w_OS = None; w_ver = None; w_wtype = wtype
+
+        origin = getattr(workload, "origin_device_id", None)
+
+        if origin is not None and allow_neighbor_lookup and random.random() < float(neighbor_lookup_prob):
+            try:
+                neighbor_ids = self.subnet.graph.get(origin)
+            except Exception:
+                # single fallback to igraph neighbors (rare)
+                try:
+                    vertex = self.subnet.graph.vs.find(name=origin)
+                    nbr_idx = self.subnet.graph.neighbors(vertex.index, mode="out")
+                    neighbor_ids = [self.subnet.graph.vs[n].attributes().get("name", None) for n in nbr_idx]
+                    neighbor_ids = [n for n in neighbor_ids if n is not None]
+                except Exception:
+                    neighbor_ids = []
+            for nid in neighbor_ids:
+                nd = self.subnet.net.get(nid)
+                if nd is None:
                     continue
+                if _device_matches(nd, w_OS, w_ver, w_wtype):
+                    nd.workload = workload
+                    workload.assigned = True
+                    workload.adversarial = bool(adversarial)
+                    return True
 
-                for neighbor_id in neighbor_ids:
-                    # Check if the edge from device_id to neighbor_id is blocked.
-                    try:
-                        source_vertex = self.subnet.graph.vs.find(name=device_id)
-                        target_vertex = self.subnet.graph.vs.find(name=neighbor_id)
-                        edge_candidates = self.subnet.graph.es.select(_source=source_vertex.index, 
-                                                                        _target=target_vertex.index)
-                        # If no edge exists or the edge is blocked, skip this neighbor.
-                        if len(edge_candidates) == 0 or edge_candidates[0]["blocked"]:
-                            continue
-                    except Exception as e:
-                        # In case of any errors during edge checking, skip this neighbor.
-                        continue
+        # 4) Last-ditch: linear scan first-fit (only if workload encodes OS or wtype) — note this is O(V)
+        if w_OS is not None or w_wtype is not None:
+            for dev_id, dev in self.subnet.net.items():
+                if _device_matches(dev, w_OS, w_ver, w_wtype):
+                    dev.workload = workload
+                    workload.assigned = True
+                    workload.adversarial = bool(adversarial)
+                    return True
 
-                    neighbor_device = self.subnet.net.get(neighbor_id)
-                    self.log_communication(device_id, neighbor_id, 'D')
-                    if neighbor_device:
-                        # Check if neighbor's OS and version match the workload.
-                        if neighbor_device.OS == workload.OS and str(neighbor_device.version) == str(workload.version):
-                            if not neighbor_device.workload:
-                                neighbor_device.workload = workload
-                                workload.assigned = True
-                                workload.adversarial = adversarial
-                                #print(f"Workload {workload.id} assigned to neighbor device {neighbor_id} (passed from {device_id})")
-                                return True
-
-        #print(f"Workload {workload.id} could not be assigned to any device")
+        # 5) no assignment
         return False
 
+    # -------------------------
+    # Generate (batch) workloads
+    # -------------------------
+    def generate_workloads(self,
+                           numLoads,
+                           mode,
+                           high,
+                           wtype='client',
+                           adversarial=False,
+                           lazy_generate: bool | None = None,
+                           lazy_local_prob: float = 0.9,
+                           neighbor_lookup_prob: float = 0.05):
+        """
+        Efficient batch workload generator with an optional 'lazy_generate' mode.
 
-    def generate_workloads(self, numLoads, mode, high , wtype = 'client', adversarial = False):
+        Args:
+            numLoads: requested number of workloads
+            mode, high: used for processing_time generation (kept for compatibility)
+            wtype: 'client' or 'server'
+            adversarial: mark produced workloads as adversarial if True
+            lazy_generate: if True, create workloads *at* sampled device but with probability (1 - lazy_local_prob)
+                           attempt to assign them elsewhere (neighbor lookup controlled by neighbor_lookup_prob).
+                           If None (default) we auto-enable lazy mode when subnet size > 500.
+            lazy_local_prob: when lazy_generate True, probability to assign locally (no graph lookup).
+            neighbor_lookup_prob: when trying to place a non-local workload, probability to perform the neighbor lookup.
 
+        Returns:
+            list of Workload objects created (some may be assigned, some may be left unassigned if no candidate)
+        """
+        if numLoads <= 0:
+            return []
 
-        assigned_devices = set()  # Set to keep track of assigned devices
+        # Auto-enable lazy mode on large graphs if caller didn't explicitly set it
+        if lazy_generate is None:
+            lazy_generate = (len(self.subnet.net) > 500)
 
-        for _ in range(numLoads):
-            device_found = False  # Flag to check if a device is found
-            for device_id, device in self.subnet.net.items():
-                if device_id not in assigned_devices and not device.workload:
-                    workload_id = str(uuid.uuid4())  # Generate a unique workload ID
-                    selected_os, selected_version = device.OS, device.version
+        # Build free candidate list once (O(V) single pass)
+        free_candidates = []
+        for dev_id, dev in self.subnet.net.items():
+            if getattr(dev, "Not_yet_added", False):
+                continue
+            if getattr(dev, "workload", None) is not None:
+                continue
+            if getattr(dev, "busy_time", 0) and dev.busy_time > 0:
+                continue
+            dev_wtype = getattr(dev, "wtype", None)
+            if wtype == 'client' and dev_wtype == 'server':
+                continue
+            if wtype == 'server' and dev_wtype != 'server':
+                continue
+            free_candidates.append(dev_id)
 
-                    # Create a Workload object with the generated workload ID and selected OS/version
-                    workload = Workload(workload_id, np.ceil(np.random.triangular(0, mode, high, 1)), selected_os, str(selected_version))
+        if not free_candidates:
+            return []
 
-                    # Try to assign the workload to a device
-                    assigned = self.assign_workload(workload, adversarial = adversarial , wtype = wtype)
-                    if assigned:
-                        assigned_devices.add(device_id)  # Mark the device as assigned
-                        device_found = True
-                        break  # Exit the loop once a device is found and assigned
-                    
-            if not device_found:
-                pass
+        k = min(int(numLoads), len(free_candidates))
+        try:
+            sampled_ids = random.sample(free_candidates, k)
+        except ValueError:
+            sampled_ids = free_candidates[:k]
 
+        created_workloads = []
+        for did in sampled_ids:
+            dev = self.subnet.net.get(did)
+            if dev is None:
+                continue
+            wid = str(uuid.uuid4())
+            processing_time = int(np.ceil(np.random.triangular(0, mode, high, 1)))
+            dev_ver = getattr(dev, "version", None)
+            w_ver = str(dev_ver) if dev_ver is not None else str(self.defaultversion)
+            # create workload targeted at this device by default (helps compatibility)
+            w = Workload(wid, processing_time, dev.OS, w_ver)
+            setattr(w, "origin_device_id", did)
+            setattr(w, "target_device_id", did)
+            setattr(w, "wtype", wtype)
 
+            if not lazy_generate:
+                # fast direct assign
+                dev.workload = w
+                w.assigned = True
+                w.adversarial = bool(adversarial)
+                created_workloads.append(w)
+                continue
 
-        
-    def process_subnet_workloads(self,debug = False):
-        # Iterate over all devices in the subnet
+            # lazy_generate path:
+            # With probability lazy_local_prob assign directly to origin (no lookup).
+            # Otherwise, try to assign elsewhere (neighbor lookup with probability neighbor_lookup_prob).
+            if random.random() < float(lazy_local_prob):
+                dev.workload = w
+                w.assigned = True
+                w.adversarial = bool(adversarial)
+                created_workloads.append(w)
+                continue
+
+            # non-local attempt: use assign_workload which encapsulates neighbor lookup + last-ditch linear scan.
+            assigned = self.assign_workload(
+                w,
+                wtype=wtype,
+                adversarial=adversarial,
+                preferred_device_id=None,
+                allow_neighbor_lookup=True,
+                neighbor_lookup_prob=float(neighbor_lookup_prob)
+            )
+            # assign_workload may have assigned via neighbor or via linear scan.
+            w.assigned = bool(assigned)
+            created_workloads.append(w)
+
+        return created_workloads
+
+    def process_subnet_workloads(self, debug=False):
+        """
+        Tick processing_time of any assigned workloads by 1.
+        When processing_time reaches 0, clear the workload from the device.
+        Returns the count of completed workloads in this tick.
+        """
         completed_workloads = 0
         for _, device in self.subnet.net.items():
-            if device.workload is not None and device.workload.processing_time is not None and device.workload.processing_time > 0:
-                device.workload.processing_time = device.workload.processing_time - 1
-                if device.workload.processing_time == 0:
-                    device.workload == None
-                    completed_workloads = completed_workloads + 1
+            wl = getattr(device, "workload", None)
+            if wl is not None and getattr(wl, "processing_time", None) is not None:
+                if wl.processing_time > 0:
+                    wl.processing_time = wl.processing_time - 1
+                    if wl.processing_time == 0:
+                        # clear the workload
+                        device.workload = None
+                        completed_workloads += 1
         return completed_workloads
 
-                
-
+    # -------------------------
+    # Reset / generation helpers
+    # -------------------------
     def resetAllSubnet(self):
         """
-        reset everything in the subnet, meaning DELETING all
+        reset everything in the subnet, meaning DELETING all devices & graph
         """
         self.subnet.net.clear()
         self.subnet.graph = ig.Graph()
         self.subnet.resetAllCompromisedSubnet()
-        for _, device in self.subnet.net.items():
-            device.set_random_success_prob()
+        # clear vertex map
+        self._vertex_name_to_index = {}
 
-        
+        # If devices existed previously, those sets remain but we cleared net; leave apps/vulns unchanged
+
     def resetByNumSubnet(self, resetNum):
-        #randomDevices are a LIST of randomly selected device's ID
-        randomDevices = self.randomSampleGenerator(self.subnet.net.keys(), resetNum)
-        self.subnet.resetSomeCompromisedSubnet(randomDevices)
-
-            
+        # randomDevices are a LIST of randomly selected device's ID
+        try:
+            randomDevices = self.randomSampleGenerator(list(self.subnet.net.keys()), resetNum)
+            self.subnet.resetSomeCompromisedSubnet(randomDevices)
+        except Exception:
+            pass
 
     def getSubnetSize(self):
-        """
-        Returns:
-            int: returns the size of the subnet, equivalent to the number of devices
-        """
+        """Returns the size of the subnet (number of devices)"""
         return len(self.subnet.net)
 
     def getNetworkSize(self):
-        """
-        Returns:
-            int: returns the size of the network, equivalent to the number of subnet in the network
-        """
+        """Returns size of the network (number of subnets)"""
         return len(self.network)
 
     def getVulneralbilitiesSize(self):
-        """
-        Returns:
-            int: returns the size of the vulerability set
-        """
+        """Returns number of vulnerabilities"""
         return len(self.vulneralbilities)
 
     def getExploitsSize(self):
-        """
-        Returns:
-            int: returns the size of the Exploit set
-        """
+        """Returns number of exploits"""
         return len(self.exploits)
 
-    def generateApps(self, numOfApps, addVul=False, numOfVul=1, vul_to = None):
-        """_summary_
-        generates a list of apps with the specified number of apps to be added to the device.
-        hence returns a list of apps.
-        Args:
-            numOfApps (int): number of apps to be generated
-        """
+    def generateApps(self, numOfApps, addVul=False, numOfVul=1, vul_to=None):
         app_list = []
-        if type(numOfApps) == int:
+        if isinstance(numOfApps, int):
             for count in range(numOfApps):
                 random_app = App(count, self.AppTypeGenerator(),
                                  self.randomNumberGenerator(1.0, 3.0))
@@ -209,9 +414,9 @@ class CyberDefenseSimulator:
                     if vul_to is None:
                         appVul = self.generateVul(numOfVul, random_app)
                     else:
-                        appVul = self.generateVul(numOfVul, random_app, mode = "target", vulID = vul_to)
-                    
-                    if(len(self.vulneralbilities)>=numOfVul):
+                        appVul = self.generateVul(numOfVul, random_app, mode="target", vulID=vul_to)
+
+                    if len(self.vulneralbilities) >= numOfVul:
                         for i in range(numOfVul):
                             random_app.addVulnerability(self.randomSampleGenerator(self.vulneralbilities))
                     else:
@@ -221,69 +426,43 @@ class CyberDefenseSimulator:
         return app_list
 
     def generateDevice(self, numOfApps=1, minVulperApp=0, maxVulperApp=0):
-        """_summary_
-        generates a list of Devices with the specified number of app,
-        number range of vulnerabilities to be added to the device.
-        hence returns a list of Devices.
-        Args:
-            numOfApps (int, optional): number of apps per device. Defaults to 1.
-            minVulperApp (int, optional): min vulnerability per app. Defaults to 0.
-            maxVulperApp (int, optional): max vulnerability per app, can be none. Defaults to 0.
-        Returns:
-            List: return list of devices as specified from the input
-        """
-        if type(numOfApps) == int:
+        if isinstance(numOfApps, int):
             AppsList = []
-            # self.generateApps(numOfApps, True, int(self.randomNumberGenerator(minVulperApp,maxVulperApp)))
             for i in range(minVulperApp, maxVulperApp):
                 AppsList.append(self.randomSampleGenerator(self.apps))
             currSize = self.getSubnetSize()
-            newDevice = Device(currSize, self.defaultOS,self.defaultversion,  0)
+            newDevice = Device(currSize, self.defaultOS, self.defaultversion, 0)
             newDevice.addApps(AppsList)
-            
             return newDevice
         else:
             print("not a valid input for generate Device")
 
-    # add devices to subnet
     def generateSubnet(self, numOfDevice, addApps=None, minVulperApp=0, maxVulperApp=0):
-        """_summary_
+        """
         add device to our subnet with the specified number of app(optional),
         number range of vulnerabilities to be added to the device.
-        no returns
-
-        Args:
-            numOfDevice (int): specifies number of app to be added to the subnet
-            addApps (List, optional): allows specified apps to be added. Defaults to None.
-            minVulperApp (int, optional): min vulnerability per app. Defaults to 0.
-            maxVulperApp (int, optional): max vulnerability per app, can be none. Defaults to 0.
-
         """
-
-        if type(numOfDevice) == int:
-            currSize = self.getSubnetSize()
-            
+        if isinstance(numOfDevice, int):
             for count in range(numOfDevice):
-               
                 if addApps is None:
                     newDevice = self.generateDevice()
                 else:
-                    newDevice = self.generateDevice(
-                        addApps, minVulperApp, maxVulperApp)
+                    newDevice = self.generateDevice(addApps, minVulperApp, maxVulperApp)
                 self.subnet.addDevices(newDevice)
-            # print(f'{numOfDevice} of devices added to subnet')
+
+            # The graph / subnet likely mutated; rebuild the vertex index map for fast lookups.
+            try:
+                self._build_vertex_name_index_map()
+            except Exception:
+                pass
         else:
             print("not a valid input for generate subnet")
 
-    #  def generateNetwork
-
-
-
     def redeploy_apps_with_unique_vulns(self,
-                                        num_apps=20,
-                                        vul_per_app=2,
-                                        min_apps_per_device=1,
-                                        max_apps_per_device=3):
+                                       num_apps=20,
+                                       vul_per_app=2,
+                                       min_apps_per_device=1,
+                                       max_apps_per_device=3):
         """
         Clears all existing apps/vulns from simulator and devices,
         then regenerates `num_apps` apps (each with `vul_per_app` vulns)
@@ -297,9 +476,9 @@ class CyberDefenseSimulator:
 
         # 2) Generate a pool of apps (with vul_per_app vulnerabilities each)
         app_pool = self.generateApps(
-            numOfApps = num_apps,
-            addVul     = True,
-            numOfVul   = vul_per_app
+            numOfApps=num_apps,
+            addVul=True,
+            numOfVul=vul_per_app
         )
 
         # 3) Shuffle & assign to devices
@@ -308,29 +487,19 @@ class CyberDefenseSimulator:
             chosen = random.sample(app_pool, k)
             device.addApps(chosen)
 
-
     def generateVul(self, numOfVul, targetApp=None, targetOS=None, mode="random", vulID=None):
-        """Generate Vulnerability, either target App is given or target OS is given, cannot be both
-            numOfVul specifies the number of vul given to the target OS or App
-        Args:
-            numOfVul (int): specifies number of vul generated to be added to the Vulnerability set
-            targetApp (App, optional): target app of the vulnerability. Defaults to None.
-            targetOS (OS, optional): target OS of the vulnerability. Defaults to None.
-            mode (str, optional): mode of operation, 'random' or 'target'. Defaults to "random".
-            vulID (int, optional): vulnerability ID from CSV when mode is 'target'. Defaults to None.
-        """
         assert mode in ('random', 'target')
         vul_probabilities = []
 
         if mode == "random":
             sampled_data = self.df.sample(n=numOfVul)
             for index, row in sampled_data.iterrows():
-                vulType = 'unknown'  # Or some logic to determine type
+                vulType = 'unknown'
                 target = targetApp if targetApp else (targetOS if targetOS else self.defaultApp)
                 newVul = Vulnerability(row['matchCriteriaId'], vulType, target)
                 self.vulneralbilities.add(newVul)
-                newVul.exploitability_score = row['exploitabilityScore']
-                newVul.impact_score = row['impactScore']
+                newVul.exploitability_score = row.get('exploitabilityScore', 0.0)
+                newVul.impact_score = row.get('impactScore', 0.0)
                 probability = newVul.exploitability_score / 10.0
                 vul_probabilities.append((newVul, probability))
                 if targetApp or targetOS:
@@ -339,11 +508,11 @@ class CyberDefenseSimulator:
             row = self.df[self.df['matchCriteriaId'] == vulID]
             if not row.empty:
                 row = row.iloc[0]
-                vulType = 'unknown'  # Or some logic to determine type
+                vulType = 'unknown'
                 target = targetApp if targetApp else (targetOS if targetOS else self.defaultApp)
                 newVul = Vulnerability(row['matchCriteriaId'], vulType, target)
-                newVul.exploitability_score = row['exploitabilityScore']
-                newVul.impact_score = row['impactScore']
+                newVul.exploitability_score = row.get('exploitabilityScore', 0.0)
+                newVul.impact_score = row.get('impactScore', 0.0)
                 self.vulneralbilities.add(newVul)
                 probability = newVul.exploitability_score / 10.0
                 vul_probabilities.append((newVul, probability))
@@ -352,59 +521,19 @@ class CyberDefenseSimulator:
         else:
             print("Invalid mode or missing vulID for target mode")
 
-        #print("Vulernability prob is: "+str(vul_probabilities))
         return vul_probabilities
 
-
     def changeVulTarget(self):
-        """
-        after vul generated and app generated, this method can be used to reset the vul target from dummy target to a randomized app
-        """
         if len(self.apps) == 0:
             print("not enough apps")
         if len(self.apps) < len(self.vulneralbilities):
             print("apps less than vul")
         for vul in self.vulneralbilities:
-            vul.setTarget(self.randomSampleGenerator(self.appss))
-    '''
-    def generateExploits(self, numOfExploits, addVul=False, minVulperExp=0, maxVulperExp=0, mode="random", expID=None):
-            """Generate specified input number of exploits that is added to the simulator's exploit subnet.
-            Args:
-                numOfExploits (int): Number of exploits to generate.
-                addVul (bool): Whether to add vulnerabilities to the exploit.
-                minVulperExp (int): Minimum number of vulnerabilities per exploit.
-                maxVulperExp (int): Maximum number of vulnerabilities per exploit.
-                mode (str): Mode of operation, 'random' or 'target'.
-                expID (str): Exploit ID from CSV when mode is 'target'.
-            """
-            currSize = len(self.exploits)
-            assert mode in ('random', 'target')
-            if mode == "random":
-                sampled_data = self.df.sample(n=numOfExploits)
-                for index, row in sampled_data.iterrows():
-                    ExpType = 'unknown'  # Or some logic to determine type
-                    newExploit = Exploit(row['matchCriteriaId'], ExpType, self.defaultApp)
-                    self.exploits.append(newExploit)  # Add to list
-                    if addVul:
-                        for i in range(int(self.randomNumberGenerator(minVulperExp, maxVulperExp))):
-                            vul = self.randomSampleGenerator(self.vulneralbilities)
-                            newExploit.setTargetVul(vul)
-            elif mode == "target" and expID is not None:
-                row = self.df[self.df['matchCriteriaId'] == expID]
-                if not row.empty:
-                    row = row.iloc[0]
-                    ExpType = 'unknown'  # Or some logic to determine type
-                    newExploit = Exploit(row['matchCriteriaId'], ExpType, self.defaultApp)
-                    self.exploits.append(newExploit)  # Add to list
-                    if addVul:
-                        for i in range(int(self.randomNumberGenerator(minVulperExp, maxVulperExp))):
-                            vul = self.randomSampleGenerator(self.vulneralbilities)
-                            newExploit.setTargetVul(vul)
-            else:
-                print("Invalid mode or missing expID for target mode")
+            try:
+                vul.setTarget(self.randomSampleGenerator(self.apps))
+            except Exception:
+                pass
 
-            print(f'{numOfExploits} of Exploits added to exploits')
-    '''
     def generateExploits(
         self,
         numOfExploits,
@@ -413,22 +542,10 @@ class CyberDefenseSimulator:
         maxVulperExp=0,
         mode="random",
         expID=None,
-        discovered = False
+        discovered=False
     ):
-        """
-        Generate `numOfExploits` exploits, each targeting exactly one fresh vulnerability.
-        Signature is unchanged so existing calls still work.
-
-        Args:
-            numOfExploits (int): how many exploits to generate
-            addVul (bool): if True, also attach additional vulnerabilities from the pool
-            minVulperExp, maxVulperExp: range for number of extra vulnerabilities to attach
-            mode (str): "random" or "target"
-            expID (str): if mode=="target", the specific CVE ID to target
-        """
         assert mode in ("random", "target"), "mode must be 'random' or 'target'"
 
-        # helper to attach extra existing vulnerabilities
         def _attach_extra(exploit):
             if not addVul or not self.vulneralbilities:
                 return
@@ -438,93 +555,59 @@ class CyberDefenseSimulator:
                 exploit.setTargetVul(extra_v)
 
         if mode == "random":
-            # 1) sample that many distinct CVE rows
             sampled = self.df.sample(n=numOfExploits, replace=False)
             for _, row in sampled.iterrows():
-                # 2) build a fresh Vulnerability object
                 new_vul = Vulnerability(
                     row["matchCriteriaId"],
                     "unknown",
                     self.defaultApp
                 )
-                new_vul.exploitability_score = row["exploitabilityScore"]
-                new_vul.impact_score        = row["impactScore"]
+                new_vul.exploitability_score = row.get("exploitabilityScore", 0.0)
+                new_vul.impact_score = row.get("impactScore", 0.0)
                 self.vulneralbilities.add(new_vul)
 
-                # 3) create an Exploit that points *only* at that new vulnerability
                 exp = Exploit(new_vul.id, "unknown", self.defaultApp)
                 exp.setTargetVul(new_vul)
-
-                # 4) optionally attach extra existing vulns
                 _attach_extra(exp)
-
                 self.exploits.append(exp)
 
         else:  # mode == "target"
             if expID is None:
                 print("Invalid mode or missing expID for target mode")
                 return
-            # find that CVE row
             subset = self.df[self.df["matchCriteriaId"] == expID]
             if subset.empty:
                 print(f"No CVE entry found for ID={expID}")
                 return
             row = subset.iloc[0]
             for _ in range(numOfExploits):
-                # 1) make a fresh Vulnerability with that exact ID
                 new_vul = Vulnerability(
                     row["matchCriteriaId"],
                     "unknown",
                     self.defaultApp
                 )
-                new_vul.exploitability_score = row["exploitabilityScore"]
-                new_vul.impact_score        = row["impactScore"]
+                new_vul.exploitability_score = row.get("exploitabilityScore", 0.0)
+                new_vul.impact_score = row.get("impactScore", 0.0)
                 self.vulneralbilities.add(new_vul)
 
-                # 2) and an Exploit targeting it
                 exp = Exploit(new_vul.id, "unknown", self.defaultApp)
                 exp.discovered = discovered
                 exp.setTargetVul(new_vul)
-
-                # 3) optionally attach extra existing vulns
                 _attach_extra(exp)
-
                 self.exploits.append(exp)
 
-        print(f"{numOfExploits} exploits added (mode={mode}).")
-
-
     def attackSubnet(self, exploit):
-        """_summary_
-            attack the subnet with a SINGLE Exploit that has valid vulnerabilities
-        Args:
-            Exploit (Exploit): one Exploit
-        """
-        print(
-            f'expected target is vulneralbility with id:{exploit.target.keys()}')
+        """attack the subnet with a SINGLE Exploit that has valid vulnerabilities"""
+        print(f'expected target is vulneralbility with id:{exploit.target.keys()}')
         self.subnet.attack(exploit, self.subnet.net)
 
     def randomNumberGenerator(self, a, b):
-        """
-        generates and return 1 decimal point random number in range a to b
-        Args:
-            a (int): lower bound
-            b (int): higher bound
-        """
         if (a == b):
             return a
         randomNum = random.randint(int(a*10), int(b*10))/10
         return randomNum
 
     def randomRangeGenerator(self, a=1.0, b=1.0):
-        """randomly generates a lower bound and a higher bound from the input range
-        Args:
-            a (float, optional): input lowest boundary. Defaults to 1.0.
-            b (float, optional): input upper boundary. Defaults to 1.0.
-
-        Returns:
-            range: returns 2 parameter, first the lower boundary, then the higher boundary
-        """
         num1 = self.randomNumberGenerator(a, b)
         num2 = self.randomNumberGenerator(a, b)
         maxR = max(num1, num2)
@@ -532,63 +615,38 @@ class CyberDefenseSimulator:
         return minR, maxR
 
     def AppTypeGenerator(self):
-        """generate app type from the 5 most common types shown below. SUBJECT TO CHANGE
-        Returns:
-            AppType: returns one of the the App type
-        """
         types = ["game", "lifestype", "social",
                  "entertainment", "productivity"]
         randomNum = random.randrange(0, len(types)-1)
         return types[randomNum]
 
     def VulTypeGenerator(self):
-        """generate vulnerability type from the common types shown below. SUBJECT TO CHANGE
-        Returns:
-            VulType: returns one of the the Vul type
-        """
         types = ["unknown", "misconfigurations", "outdated software",
                  "unauthorized access", "weak user credentials", "Unsecured APIs"]
         randomNum = random.randrange(0, len(types)-1)
         return types[randomNum]
 
     def ExpTypeGenerator(self):
-        """generate exploit type from the 2 types shown below. SUBJECT TO CHANGE
-        Returns:
-            Exploit Type: returns one of the the exploit type
-        """
         types = ["unknown", "known"]
         randomNum = random.randrange(0, len(types)-1)
         return types[randomNum]
 
     def randomSampleGenerator(self, sampleSet, numOfSample=1):
-        """_summary_
-        generates 1 sample basd on chosen set given by the argument
-        Args:
-            sampleSet (set): specifies which set to chose (from the private var in constructor)
-            numOfSample (int): specifies the number of Sample to be returned. default to 1
-        Returns:
-            type of the set: 1 sample or a list depending on the parameter numOfSample
-        """
-        
         listSet = list(sampleSet)
-        if numOfSample==1 or len(sampleSet)<numOfSample:
+        if numOfSample == 1 or len(sampleSet) < numOfSample:
             return random.choice(listSet)
         else:
             multiSample = set()
-            i=0
-            while(len(multiSample)!=numOfSample):
+            i = 0
+            while len(multiSample) != numOfSample:
                 app = random.choice(listSet)
                 multiSample.add(app)
-                i=i+1
-                if i>1000:
+                i = i + 1
+                if i > 1000:
                     break
             return list(multiSample)
 
-   
-
     def getinfo(self):
-        """diplay info about the subnet, mainly for debug purpose
-        """
         print("subnet : ")
         for devId, dev in self.subnet.net.items():
             print("\t device id: " + str(dev.getId()))
@@ -599,7 +657,9 @@ class CyberDefenseSimulator:
         for exp in self.exploits:
             print("\t exploits id: " + str(exp.getId()))
 
-
+# -------------------------
+# Logger and Detector (unchanged logic, small robustness tweaks)
+# -------------------------
 class Logger:
     def __init__(self):
         self.logs = []
@@ -618,9 +678,7 @@ class Logger:
     def clear_logs(self):
         self.logs = []
 
-
 class Detector:
-    
     def __init__(self, contamination=0.1):
         self.model = IsolationForest(n_estimators=2, max_samples=256, n_jobs=1)
         self.trained = False
@@ -630,7 +688,6 @@ class Detector:
         if logs is None or len(logs) == 0:
             # Initialize random detection logic
             self.random_detection = True
-            #print("Using random detection due to insufficient training data.")
         else:
             X = [[log["from_device"], log["to_device"]] for log in logs]
             self.model.fit(X)
@@ -638,12 +695,10 @@ class Detector:
             self.random_detection = False
 
     def predict(self, from_device, to_device, return_score=False):
-        # Random detection mode if there is no training data.
         if self.random_detection:
             result = random.choice(["A", "D"])
             return (result, None) if return_score else result
 
-        # If not trained, default to non-anomalous ("D")
         if not self.trained:
             return ("D", None) if return_score else "D"
 
@@ -652,10 +707,8 @@ class Detector:
         result = "A" if prediction == -1 else "D"
 
         if return_score:
-            # Get anomaly score: lower scores indicate higher anomaly likelihood.
             score = self.model.decision_function(point)
-            # score_samples returns an array; extract the first element.
-            return result, score[0]
+            return result, float(score[0])
         return result
 
     def batch_predict(self, log_points):
@@ -670,14 +723,16 @@ class Detector:
         return ["A" if pred == -1 else "D" for pred in predictions]
 
     def evaluate(self, test_logs):
+        if not test_logs:
+            return {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0}
         X_test = [[log["from_device"], log["to_device"]] for log in test_logs]
-        y_true = [1 if log["kind"] == "A" else 0 for log in test_logs]  # Assume "A" is the anomaly class
+        y_true = [1 if log["kind"] == "A" else 0 for log in test_logs]
         y_pred = [1 if self.model.predict([x])[0] == -1 else 0 for x in X_test]
 
         accuracy = accuracy_score(y_true, y_pred)
-        precision = precision_score(y_true, y_pred)
-        recall = recall_score(y_true, y_pred)
-        f1 = f1_score(y_true, y_pred)
+        precision = precision_score(y_true, y_pred, zero_division=0)
+        recall = recall_score(y_true, y_pred, zero_division=0)
+        f1 = f1_score(y_true, y_pred, zero_division=0)
 
         return {
             "accuracy": accuracy,
