@@ -1,4 +1,4 @@
-# IPPO.py
+# MAPPO.py
 from __future__ import annotations
 
 import math
@@ -130,7 +130,7 @@ class GATLayer(nn.Module):
         return self.ln(x + out)
 
 # =============================
-# Actor-Critic (IPPO, per-device actors)
+# Actor-Critic (MAPPO, per-device actors)
 # =============================
 class CommActorCritic(nn.Module):
     """
@@ -198,9 +198,9 @@ class CommActorCritic(nn.Module):
 # =============================
 # Policy wrapper (execution)
 # =============================
-class IPPOCommPolicy:
+class MAPPOCommPolicy:
     """
-    Greedy executor for trained IPPO with per-device independent actors.
+    Greedy executor for trained MAPPO with per-device independent actors.
     Builds grouped actions and relies on env.step(list_of_groups) -> step_grouped.
     Visibility-aware: only acts on visible devices.
     """
@@ -228,11 +228,11 @@ class IPPOCommPolicy:
     def _ensure_sizes(self, state_vec: np.ndarray, env=None):
         s = np.asarray(state_vec, dtype=np.float32)
         if s.shape[0] != self._expected_in:
-            raise RuntimeError(f"[IPPO] State len {s.shape[0]} != expected {self._expected_in}.")
+            raise RuntimeError(f"[MAPPO] State len {s.shape[0]} != expected {self._expected_in}.")
         if env is not None:
             D_env = int(getattr(env, "Max_network_size", self._expected_D))
             if D_env != self._expected_D:
-                raise RuntimeError(f"[IPPO] Device count {D_env} != policy {self._expected_D}.")
+                raise RuntimeError(f"[MAPPO] Device count {D_env} != policy {self._expected_D}.")
 
     @torch.inference_mode()
     def select_action(self, state_vec: np.ndarray, env=None):
@@ -310,9 +310,9 @@ def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
     return adv, returns
 
 # =============================
-# IPPO Best-Response Trainer
+# MAPPO Best-Response Trainer
 # =============================
-class IPPOCommBestResponse:
+class MAPPOCommBestResponse:
     """
     Best-response trainer with *independent per-device actors* + centralized critic.
     Visibility-aware: never samples/updates/acts on invisible devices.
@@ -401,9 +401,9 @@ class IPPOCommBestResponse:
                 fixed = strat.actions[t % len(strat.actions)]
                 return [fixed]  # single-group list
 
-            if strat.type_mapping and ('IPPO' in strat.type_mapping or 'marl' in strat.type_mapping):
+            if strat.type_mapping and ('mappo' in strat.type_mapping or 'marl' in strat.type_mapping):
                 state_vec = env._get_defender_state() if turn == 'defender' else env._get_attacker_state()
-                marl_agent = strat.type_mapping.get('IPPO', strat.type_mapping.get('marl'))
+                marl_agent = strat.type_mapping.get('mappo', strat.type_mapping.get('marl'))
                 try:
                     groups = marl_agent.select_action(state_vec, env=env)
                     return groups if isinstance(groups, list) else [groups]
@@ -799,7 +799,7 @@ class IPPOCommBestResponse:
                 break
 
         # package trained policy
-        policy = IPPOCommPolicy(self.oracle, self.role, state_dict=self.net.state_dict())
-        strat = Strategy(type_mapping={"ippo": policy})
+        policy = MAPPOCommPolicy(self.oracle, self.role, state_dict=self.net.state_dict())
+        strat = Strategy(type_mapping={"mappo": policy})
         strat.add_payoff(total_reward)
         return strat
