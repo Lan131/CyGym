@@ -6,6 +6,7 @@ import random
 import igraph as ig
 import igraph as ig
 import numpy as np
+import pymetis
 
 
 def os_encoder(os, os_types):
@@ -550,6 +551,36 @@ class Subnet:
         # print(res_dct)
         return res_dct
 
+
+
+    def create_partitions(self, partition_size: int):
+        """
+        Partition the current set of devices into disjoint subsets of size ~partition_size
+        by calling METIS via pymetis.
+        """
+        # 0) how many vertices?
+        n = len(self.graph.vs)
+        if n == 0:
+            raise ValueError("Cannot partition an empty graph")
+        # 1) compute number of parts so each is ~partition_size
+        nparts = max(1, math.ceil(n / partition_size))
+        # but METIS won’t accept nparts>n
+        nparts = min(nparts, n)
+
+        # 2) build adjacency-list for pymetis: list of neighbors for each v.index
+        adj = [list(self.graph.neighbors(v.index, mode="all")) for v in self.graph.vs]
+
+        # 3) call METIS
+        (edgecuts, membership) = pymetis.part_graph(nparts, adjacency=adj)
+
+        # 4) invert membership → list of parts → device‑IDs
+        parts: List[List[int]] = [[] for _ in range(nparts)]
+        for idx, part_id in enumerate(membership):
+            vid = self.graph.vs[idx]["name"]
+            parts[part_id].append(vid)
+
+        self.partitions = parts
+
     def initializeRandomGraph(self, num_devices, connection_probability=1):
         """
         Initialize a random directed graph for the subnet.
@@ -581,16 +612,23 @@ class Subnet:
 
     def initializeVoltTyGraph(self, num_devices, m=2):
         """
-        Initialize a scale-free directed graph for the subnet using the Barabási-Albert model.
+        Faster initialization of a scale-free directed graph for the subnet using
+        igraph's Barabasi generator + minimized Python overhead.
 
         Args:
-        - num_devices: Number of devices in the network.
-        - m: Number of edges to attach from a new node to existing nodes. Default is 2.
+        - num_devices: number of devices
+        - m: number of edges to attach from a new node to existing nodes (Barabasi param)
+        Returns:
+        - igraph.Graph instance
         """
-        # Generate a directed Barabási-Albert graph
+
+
+        # --- Generate directed BA graph (C-implemented; keep this) ---
+        # Note: igraph's generator is in C; its cost is typically O(n) but we're
+        # optimizing the Python-side work post-generation.
         g = ig.Graph.Barabasi(n=num_devices, m=m, directed=True)
 
-        # Assign device types and OS types
+        # --- Pre-define types/os mappings locally for speed ---
         device_types = ['router', 'switch', 'server', 'workstation', 'firewall', 'VPN_gateway']
         os_types = {
             'router': ['Embedded Linux', 'Cisco IOS', 'Juniper Junos'],
@@ -600,36 +638,71 @@ class Subnet:
             'firewall': ['Embedded Linux', 'Cisco IOS', 'Juniper Junos'],
             'VPN_gateway': ['Embedded Linux', 'Cisco IOS', 'Juniper Junos']
         }
+        linux_versions = [1.0, 2.0, 3.0]
 
-        for i in range(num_devices):
-            device_type = random.choice(device_types)
-            os_choice = random.choice(os_types[device_type])
-            address = f"192.168.0.{i}"
-            version = str(random.choice([1.0, 2.0, 3.0])) if 'Linux' in os_choice else '1.0'
-            os_object = OperatingSystem(id=i, type=os_choice, version=version)
+        # Bulk sample device types (faster than calling random.choice each iteration)
+        chosen_types = random.choices(device_types, k=num_devices)
+
+        # Prepare self.net if not already
+        if not hasattr(self, "net") or self.net is None:
+            self.net = {}
+
+        # Tight local bindings to reduce attribute lookups
+        net_local = self.net
+        OSClass = OperatingSystem
+        DeviceClass = Device
+        rng_choice = random.choice
+        str_fmt = "192.168.0.{}"
+
+        # Create devices in a tight loop (no igraph calls here)
+        for i, dtype in enumerate(chosen_types):
+            # pick os for this device type
+            os_choice = rng_choice(os_types[dtype])
+            # version selection: keep the old behavior
+            version = str(rng_choice(linux_versions)) if 'Linux' in os_choice else '1.0'
+            os_object = OSClass(id=i, type=os_choice, version=version)
 
             device = Device(
                 id=i,
                 OS=os_object,
-                address=address,
+                address=str_fmt.format(i),
                 version=version
             )
-            device.device_type = device_type
-            self.net[i] = device
+            device.device_type = dtype
+            net_local[i] = device
 
-        device_ids = list(self.net.keys())
+        # --- Assign vertex "name" attribute (one list assignment, fastest) ---
+        device_ids = list(range(num_devices))
         g.vs["name"] = device_ids
-        for edge in g.es:
-            edge["blocked"] = False
 
-        # Store the igraph object
+        # --- Assign edge attribute 'blocked' in a single shot (fast) ---
+        ec = g.ecount()
+        if ec > 0:
+            g.es["blocked"] = [False] * ec
+
+        # --- Build graph_dict efficiently via adjacency list (avoid g.vs.find per node) ---
+        # g.get_adjlist returns list-of-lists of vertex indices (in vertex order)
+        adjlist = g.get_adjlist(mode="out")  # list indexed by vertex index
+        # Vertex order corresponds to indices 0..n-1 with g.vs["name"] assigned above.
+        # Map index -> device_id (here they are identical, but using generic mapping):
+        vid_map = g.vs["name"]
+        # Build dict: device_id -> list of neighbor device_ids
+        graph_dict = {}
+        # localize for speed
+        for idx, neigh_indices in enumerate(adjlist):
+            vid = vid_map[idx]
+            # convert neighbor indices to device ids (fast list comprehension)
+            if neigh_indices:
+                graph_dict[vid] = [vid_map[n] for n in neigh_indices]
+            else:
+                graph_dict[vid] = []
+
+        # store graph and the dict on self
         self.graph = g
-
-        # Convert igraph Graph object to a dictionary representation
-        self.graph_dict = {device_id: g.neighbors(g.vs.find(name=device_id).index, mode="out") for device_id in device_ids}
-
+        self.graph_dict = graph_dict
 
         return g
+
 
 
     def get_neighbors(self, device_id):
