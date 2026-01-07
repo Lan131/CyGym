@@ -13,7 +13,7 @@ import sys
 import copy
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.model_selection import train_test_split
-
+from pathlib import Path
 
 class CyberDefenseEnv(gym.Env):
     def __init__(self):
@@ -38,7 +38,7 @@ class CyberDefenseEnv(gym.Env):
         self.work_done = 0
         self.tech = "DQN"
         self.removed_cnt = 0
-        self.debug=True
+        self.debug=False
         self.fast_Scan = True
         self.its = None
         self.lambda_events = .7
@@ -55,8 +55,13 @@ class CyberDefenseEnv(gym.Env):
         self.zero_day = False   # Set to True to activate Bayesian zero‐day logic.
         self._rng = np.random.RandomState()
         self.max_Dz = 6
+        self.checkpoint = None
+        self.turbo = True
+        self.workload_cap = 0 
+        self.time_budget_exceeded = None #early stopping
+        self.time_budget_seconds = 2.592e12
         
-        
+       
     def set_exploit_seed(self, seed: int):
         """
         Fix the exploit RNG so that all future draws come from a single
@@ -95,6 +100,27 @@ class CyberDefenseEnv(gym.Env):
         ids     = sorted(self.simulator.subnet.net.keys())
         devices = [self.simulator.subnet.net[i] for i in ids]
         return devices[: self.Max_network_size]
+
+
+
+
+    def save_figure_no_overwrite(self,fig, filepath, **savefig_kwargs):
+        """
+        Save a matplotlib figure without overwriting.
+        If `filepath` exists, appends ' (1)', ' (2)', ... before the extension.
+        """
+        path = Path(filepath)
+        stem = path.stem
+        suffix = path.suffix
+
+        candidate = path
+        counter = 1
+        while candidate.exists():
+            candidate = path.with_name(f"{stem} ({counter}){suffix}")
+            counter += 1
+
+        fig.savefig(candidate, **savefig_kwargs)
+        print(f"🔒 Saved network visualization to {candidate}")
 
     def os_to_float(self, os_obj):
         """
@@ -209,23 +235,7 @@ class CyberDefenseEnv(gym.Env):
         # 5) Concatenate device info (M*4) + exploit bits (MaxE) → length = M*4 + MaxE
         return np.concatenate([attacker_flat, exploit_bits]).astype(np.float32)
 
-    '''
-    def _get_attacker_state(self):
-        flat = self._get_state()
-        M, C = self.Max_network_size, 6
-        mat = flat.reshape(M, C)
 
-        devices = self._get_ordered_devices()
-        for i, d in enumerate(devices):
-            if (not d.Known_to_attacker) or d.Not_yet_added or (not d.attacker_owned):
-                mat[i, :] = -1
-            else:
-                mat[i, 3] = -1  # hide anomaly_score
-                mat[i, 5] = -1  # hide Not_yet_added
-
-        # drop the Known_to_attacker column (col 4)
-        return mat[:, :4].flatten()
-    '''
 
 
     def _get_defender_state(self):
@@ -258,15 +268,17 @@ class CyberDefenseEnv(gym.Env):
         return [seed]
 
         
-    def checkpoint_variables(self, filename,r):
-        # Define a dictionary of variables to save
+    def checkpoint_variables(self, filename, r):
+        """Save current simulator state in memory (and optionally to disk)."""
         variables = {
             'simulator': self.simulator,
             'mode': self.mode,
             'reward': r
         }
-        with open(filename, 'wb') as f:
-            pickle.dump(variables, f)
+        self.checkpoint = variables  # in-memory save
+        # If you still want a file backup, uncomment below:
+        # with open(filename, 'wb') as f:
+        #     pickle.dump(variables, f)
 
     def step(self, action):
         action_type, exploit_indices, device_indices, app_index = action   # action is a tuple (action_type, exploit, [device_indices],app indicies)
@@ -527,69 +539,14 @@ class CyberDefenseEnv(gym.Env):
         ax.legend(loc="upper right")
 
         # 10) save
-        fig.savefig(filepath, bbox_inches="tight")
+        #fig.savefig(filepath, bbox_inches="tight")
+        self.save_figure_no_overwrite(fig, filepath, bbox_inches="tight")
         plt.close(fig)
         print(f"🔒 Saved network visualization to {filepath}")
         
     def _check_done(self,action):
-        #For a variety of reasons we comment this out, but it may be worth bringing back, especially if there is a static network
-        '''
-        action_type, exploit_indices, device_indices, app_index = action
-        for exploit_idx in exploit_indices:
-            exploit = next((e for e in self.simulator.exploits if e.id == exploit_idx), None)
-            compromised_devices = [idx for idx, device in self.simulator.subnet.net.items() if device.isCompromised or device.attacker_owned]
-            possible_targets = 0
-            for device_id in compromised_devices:                   
-                device = self.simulator.subnet.net[device_id]
-                try:
-                    neighbor_ids = self.simulator.subnet.graph.get(device_id)
-                except:
-                    vertex = self.simulator.subnet.graph.vs.find(name=device_id)
-                    neighbor_ids = self.simulator.subnet.graph.neighbors(vertex.index, mode="out")
-                    neighbor_ids = [self.simulator.subnet.graph.vs[neighbor].attributes()["name"] for neighbor in neighbor_ids]
-                if not neighbor_ids:  # If there are no neighbors, skip to next device
-                    continue
-                source_vertex = self.simulator.subnet.graph.vs.find(name=device_id)
-                for neighbor_id in neighbor_ids:
-                    # Check if the edge from device_id to neighbor_id is blocked
-                    neighbor_device = self.simulator.subnet.net.get(neighbor_id)
-                    
-                    try:
-                        target_vertex = self.simulator.subnet.graph.vs.find(name=neighbor_id)
-                        edge_candidates = self.simulator.subnet.graph.es.select(_source=source_vertex.index, _target=target_vertex.index)
-                        # If no edge is found or the edge is blocked, skip this neighbor.
-                        if len(edge_candidates) == 0 or edge_candidates[0]["blocked"]:
-                            continue
-                    except Exception as e:
-                        if self.debug:
-                            logging.error(f"Error checking edge between {device_id} and {neighbor_id}: {e}")
-                        continue
 
-
-                
-                    if device.device_type == "DomainController":
-                        possible_targets = possible_targets+1
-
-                    if neighbor_device.reachable_by_attacker:
-                        possible_targets = possible_targets +1
-                    if neighbor_device and not neighbor_device.isCompromised and neighbor_device.Known_to_attacker:
-                        for app in neighbor_device.apps.values():
-                            for vul in app.vulnerabilities.values():  # Iterate over the values
-                                if exploit is not None:
-                                    if vul.id in exploit.target:  # Check if the vulnerability exists in the exploit's targets
-                                        possible_targets = possible_targets +1
-                        if neighbor_device.isCompromised:
-                            possible_targets = possible_targets +1
-            if possible_targets == 0:
-                # look for any compromised device that isn’t purely attacker_owned
-                non_owned = [
-                    idx for idx in compromised_devices
-                    if not self.simulator.subnet.net[idx].attacker_owned
-                ]
-                if non_owned:
-                    return True
-        '''
-        if self.step_num > 100:
+        if self.step_num > 1000:
             return True
             
         return False
@@ -623,88 +580,298 @@ class CyberDefenseEnv(gym.Env):
 
 
 
-
-
-
     def evolve_network(self):
-        # Set the average event rate per time step (lambda)
-        lambda_events= self.lambda_events
-        p_add = self.p_add 
-        p_attacker = self.p_attacker
-        # Sample number of events in this time step from a Poisson distribution
+        """
+        Optimized network evolution:
+        - O(λ) event handling (no O(λ·N) list rebuilds)
+        - changed-only vertex attribute writes
+        - star reconnection for attacker-owned devices (O(A) vs O(A^2))
+        - PA for newly activated non-attackers using one degree snapshot per evolve
+        - conditional cache rebuild (only if edges changed)
+        """
+        # --- params / RNG ---
+        lambda_events = getattr(self, "lambda_events", 0.0)
+        p_add         = getattr(self, "p_add", 0.5)
+        p_attacker    = getattr(self, "p_attacker", 0.0)
+
+        g = self.simulator.subnet.graph
+
+        # ---------- build or validate name->index mapping ----------
+        # Create a robust mapping from possible vertex 'name' representations to index.
+        # We store name as-is, str(name), and also the integer index, to be resilient.
+        if not hasattr(self, "_node_name_to_idx") or self._node_name_to_idx is None:
+            m = {}
+            try:
+                # enumerate vertices once
+                for idx, v in enumerate(g.vs):
+                    try:
+                        vname = v["name"]
+                    except Exception:
+                        vname = None
+                    # primary keys we store: raw value, stringified, and the numeric index
+                    if vname is not None:
+                        m[vname] = idx
+                        try:
+                            m[str(vname)] = idx
+                        except Exception:
+                            pass
+                    m[idx] = idx
+                    try:
+                        m[str(idx)] = idx
+                    except Exception:
+                        pass
+            except Exception:
+                m = {}
+            self._node_name_to_idx = m
+
+        # helper to get a vertex index by name with caching and a single fallback to igraph.find
+        def _get_vid_index(nid):
+            # fastest path: direct dict lookup (handles int/string forms)
+            if nid in self._node_name_to_idx:
+                return self._node_name_to_idx[nid]
+            # try stringified key
+            s = None
+            try:
+                s = str(nid)
+            except Exception:
+                s = None
+            if s is not None and s in self._node_name_to_idx:
+                return self._node_name_to_idx[s]
+            # fallback: try igraph find once and cache result (avoid repeated scans)
+            try:
+                idx = g.vs.find(name=nid).index
+                self._node_name_to_idx[nid] = idx
+                try:
+                    self._node_name_to_idx[str(nid)] = idx
+                except Exception:
+                    pass
+                return idx
+            except Exception:
+                # not found
+                return None
+
+        # --- initialize incremental active/inactive sets on first run ---
+        if not hasattr(self, "_active_ids") or not hasattr(self, "_inactive_ids"):
+            act, inact = set(), set()
+            for d in self.simulator.subnet.net.values():
+                (act if not d.Not_yet_added else inact).add(d.id)
+            self._active_ids = act
+            self._inactive_ids = inact
+
+        newly_activated = set()
+        newly_deactivated = set()
+
+        # We’ll track whether we changed topology (edges) so we know if caches must rebuild.
+        edges_changed = False
+
+        # --- Poisson number of events ---
         num_events = np.random.poisson(lam=lambda_events)
 
+        # Fast pick helpers from the incremental sets
+        def pick_from(s):
+            # random choice from a set without materializing a big list repeatedly
+            if not s:
+                return None
+            return random.choice(tuple(s))
 
-        # Track the set of device IDs that become newly activated in this step.
-        newly_activated = set()
-
+        # --- handle events (activate or deactivate) ---
         for _ in range(num_events):
             if random.random() < p_add:
-                # Addition event: activate an inactive node if available.
-                inactive_nodes = [d for d in self.simulator.subnet.net.values() if d.Not_yet_added]
-                if inactive_nodes :
+                # Addition event: activate an inactive node (if any)
+                node_id = pick_from(self._inactive_ids)
+                if node_id is not None:
+                    dev = self.simulator.subnet.net[node_id]
+                    dev.Not_yet_added = False
+                    self._inactive_ids.discard(node_id)
+                    self._active_ids.add(node_id)
+                    newly_activated.add(node_id)
 
-                    node_to_activate = random.choice(inactive_nodes)
-                    node_to_activate.Not_yet_added = False
-                    newly_activated.add(node_to_activate.id)
-                    # With probability p_attacker, mark the activated node as attacker owned.
+                    # With probability p_attacker, mark as attacker owned on activation.
                     if random.random() < p_attacker:
-                        node_to_activate.isCompromised = True
-                        node_to_activate.attacker_owned = True
-                        node_to_activate.Known_to_attacker = True
+                        dev.isCompromised = True
+                        dev.attacker_owned = True
+                        dev.Known_to_attacker = True
                         if self.debug:
-                            #print("Added node")
-                            logging.debug(f"Activated node {node_to_activate.id} as attacker owned via Poisson event.")
+                            logging.debug(f"Activated node {node_id} as attacker-owned via Poisson event.")
                     else:
                         if self.debug:
-                            logging.debug(f"Activated node {node_to_activate.id} via Poisson event.")
+                            logging.debug(f"Activated node {node_id} via Poisson event.")
             else:
-                # Removal event: mask (remove) an active node,
-                # but only if there are more than the minimum required active devices.
-                
-                active_nodes = [d for d in self.simulator.subnet.net.values() if not d.Not_yet_added]
-                if len(active_nodes) > self.numOfDevice and len(active_nodes) >= self.Min_network_size:
-                    node_to_mask = random.choice(active_nodes)
-                    node_to_mask.Not_yet_added = True
-                    node_to_mask.workload = None
-                    node_to_mask.busy_time = 0
-                    node_to_mask.removed_before = 1
-                    if self.debug:
-                        logging.debug(f"Removed node {node_to_mask.id} via Poisson event.")
-                        #print("removed node")
+                # Removal event: deactivate a currently active node if over minimum
+                if len(self._active_ids) > max(getattr(self, "numOfDevice", 0),
+                                            getattr(self, "Min_network_size", 0)):
+                    node_id = pick_from(self._active_ids)
+                    if node_id is not None:
+                        dev = self.simulator.subnet.net[node_id]
+                        dev.Not_yet_added = True
+                        dev.workload = None
+                        dev.busy_time = 0
+                        dev.removed_before = 1
+                        self._active_ids.discard(node_id)
+                        self._inactive_ids.add(node_id)
+                        newly_deactivated.add(node_id)
+                        if self.debug:
+                            logging.debug(f"Removed node {node_id} via Poisson event.")
 
-
-        # --- Now update the underlying graph ---
-        g = self.simulator.subnet.graph  # your igraph Graph object
-
-        # Gather the set of active device IDs.
-        active_ids = {d.id for d in self.simulator.subnet.net.values() if not d.Not_yet_added}
-
-        # Update vertex attribute "active" for each vertex in the graph.
-        for vertex in g.vs:
-            vertex["active"] = (vertex["name"] in active_ids)
-
-        # Update connections for attacker-owned devices.
-        attacker_owned_devices = [d.id for d in self.simulator.subnet.net.values() 
-                                if d.attacker_owned and not d.Not_yet_added]
-        self.simulator.subnet.connectAttackerOwnedDevices(g, attacker_owned_devices)
-
-        # For newly activated non-attacker devices, connect them preferentially if they are isolated.
-        for device_id in newly_activated:
-            device = self.simulator.subnet.net[device_id]
-            # Only proceed if this device is active and not attacker owned.
-            if not device.Not_yet_added and not device.attacker_owned:
-                # Check the current degree in the graph.
+        # --- update vertex["active"] ONLY for changed vertices ---
+        if newly_activated or newly_deactivated:
+            changed = newly_activated | newly_deactivated
+            # Build a tiny lookup for speed
+            changed_map = {vid: True for vid in newly_activated}
+            changed_map.update({vid: False for vid in newly_deactivated})
+            # Update attributes on just these vertices using fast index lookup
+            for vid in changed:
+                idx = _get_vid_index(vid)
+                if idx is None:
+                    # vertex not found; skip
+                    continue
                 try:
-                    vertex = g.vs.find(name=device.id)
-                except Exception as e:
-                    continue  # Skip if not found.
-                if g.degree(vertex.index) < 1:
-                    # Connect this device using preferential attachment.
-                    self.connectNonAttackerDevice(g, device.id, m=1)
-                    if self.debug:
-                        logging.debug(f"Connected non-attacker device {device.id} using Barabási preferential attachment.")
+                    g.vs[idx]["active"] = changed_map[vid]
+                except Exception:
+                    # tolerate unexpected attribute errors
+                    try:
+                        v = g.vs[idx]
+                        v["active"] = changed_map[vid]
+                    except Exception:
+                        continue
+
+        # --- Reconnect attacker-owned devices (STAR, not clique) ---
+        active_attacker_ids = [d.id for d in self.simulator.subnet.net.values()
+                            if d.attacker_owned and (d.id in self._active_ids)]
+
+        if active_attacker_ids:
+            hub = active_attacker_ids[0]
+            new_edges = []
+            hub_idx = _get_vid_index(hub)
+
+            for nid in active_attacker_ids[1:]:
+                n_idx = _get_vid_index(nid)
+                if n_idx is None:
+                    continue
+                # Create bidirectional edges if missing.
+                if hub_idx is not None:
+                    if g.get_eid(hub_idx, n_idx, directed=True, error=False) == -1:
+                        new_edges.append((hub_idx, n_idx))
+                    if g.get_eid(n_idx, hub_idx, directed=True, error=False) == -1:
+                        new_edges.append((n_idx, hub_idx))
+
+            if new_edges:
+                g.add_edges(new_edges)
+                # Ensure 'blocked' attribute exists and default False for new edges
+                if "blocked" not in g.es.attributes():
+                    g.es["blocked"] = [False] * g.ecount()
+                else:
+                    start = g.ecount() - len(new_edges)
+                    try:
+                        g.es[start:]["blocked"] = [False] * len(new_edges)
+                    except Exception:
+                        # fallback: set the last edges individually
+                        for i in range(start, g.ecount()):
+                            try:
+                                g.es[i]["blocked"] = False
+                            except Exception:
+                                pass
+                edges_changed = True
+
+        # --- For newly activated non-attackers, ensure connectivity if isolated (PA m=1) ---
+        need_pa = False
+        pa_candidates = []
+        if newly_activated:
+            # quick filter: just the newly activated, non-attacker, still active
+            for nid in list(newly_activated):
+                dev = self.simulator.subnet.net[nid]
+                if dev.Not_yet_added or dev.attacker_owned:
+                    continue
+                idx = _get_vid_index(nid)
+                if idx is None:
+                    continue
+                if g.degree(idx) < 1:
+                    need_pa = True
+                    break
+
+            if need_pa:
+                # Build candidates = list of *active* vertices (excluding the isolated one per-attachment)
+                active_vertex_indices = []
+                for aid in self._active_ids:
+                    idx = _get_vid_index(aid)
+                    if idx is not None:
+                        active_vertex_indices.append(idx)
+
+                if active_vertex_indices:
+                    degs = g.degree(active_vertex_indices, mode="ALL")
+                    pa_candidates = list(zip(active_vertex_indices, [d + 1 for d in degs]))
+
+                if pa_candidates:
+                    # Precompute cumulative weights for O(log M) sampling
+                    import bisect
+                    weights = [w for _, w in pa_candidates]
+                    cdf = []
+                    s = 0
+                    for w in weights:
+                        s += w
+                        cdf.append(s)
+
+                    def sample_pa():
+                        if not cdf:
+                            return None
+                        r = random.uniform(0, cdf[-1])
+                        j = bisect.bisect_left(cdf, r)
+                        return pa_candidates[j][0]  # return vertex idx
+
+                    for nid in list(newly_activated):
+                        dev = self.simulator.subnet.net[nid]
+                        if dev.Not_yet_added or dev.attacker_owned:
+                            continue
+                        idx = _get_vid_index(nid)
+                        if idx is None:
+                            continue
+                        if g.degree(idx) < 1:
+                            tgt_idx = sample_pa()
+                            if tgt_idx is None:
+                                continue
+                            # add a single edge v -> tgt (and optionally tgt -> v)
+                            if g.get_eid(idx, tgt_idx, directed=True, error=False) == -1:
+                                g.add_edges([(idx, tgt_idx)])
+                                edges_changed = True
+                                # ensure blocked attr for the new edge
+                                if "blocked" not in g.es.attributes():
+                                    g.es["blocked"] = [False] * g.ecount()
+                                else:
+                                    try:
+                                        g.es[g.ecount()-1]["blocked"] = False
+                                    except Exception:
+                                        pass
+
+        # --- Rebuild caches only if edges actually changed ---
+        if edges_changed:
+            # If topology changed but vertex set remains same, our index map is still valid.
+            # If you ever add/remove vertices elsewhere, you should rebuild _node_name_to_idx accordingly.
+            try:
+                self._rebuild_graph_cache()
+            finally:
+                # If the graph library reindexed vertices in rebuild, try to refresh index map conservatively.
+                # Rebuild mapping to be safe (cheap relative to heavy graph ops).
+                try:
+                    m = {}
+                    for idx, v in enumerate(g.vs):
+                        try:
+                            vname = v["name"]
+                        except Exception:
+                            vname = None
+                        if vname is not None:
+                            m[vname] = idx
+                            try:
+                                m[str(vname)] = idx
+                            except Exception:
+                                pass
+                        m[idx] = idx
+                        try:
+                            m[str(idx)] = idx
+                        except Exception:
+                            pass
+                    self._node_name_to_idx = m
+                except Exception:
+                    # if rebuild fails, keep old map (best-effort)
+                    pass
 
 
-def calculate_max_compromise_proportion(simulator):
-  return 1
