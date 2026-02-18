@@ -14,7 +14,7 @@ import random
 from volt_typhoon_env import Volt_Typhoon_CyberDefenseEnv
 
 env = Volt_Typhoon_CyberDefenseEnv()
-env.snapshot_path="initial_net_DO_its1.pkl"
+env.snapshot_path="initial_net_DO_its100.pkl"
 env.reset(from_init=True)
 
 env.generate_viz()
