@@ -3,6 +3,8 @@
 A **Cybersecurity Simulation Environment for Game-Theoretic Analysis**, accepted to GameSec 2025.
 https://arxiv.org/abs/2506.21688
 
+Updated code base for FLAIRS paper **A Scalable Approach to Solving Simulation-Based Network Security Games** https://arxiv.org/abs/2602.16564
+
 ---
 
 ## 📂 Repository Structure
