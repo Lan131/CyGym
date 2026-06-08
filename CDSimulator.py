@@ -305,7 +305,7 @@ class CyberDefenseSimulator:
             if dev is None:
                 continue
             wid = str(uuid.uuid4())
-            processing_time = int(np.ceil(np.random.triangular(0, mode, high, 1)))
+            processing_time = int(np.ceil(np.random.triangular(0, mode, high)))
             dev_ver = getattr(dev, "version", None)
             w_ver = str(dev_ver) if dev_ver is not None else str(self.defaultversion)
             # create workload targeted at this device by default (helps compatibility)
