@@ -1470,7 +1470,7 @@ if __name__ == "__main__":
         env.base_line        = baseline
         env.tech             = "DO"
         env.mode             = "defender"
-        env.Max_network_size = num_dev + 10
+        env.Max_network_size = its + 10
         
         
         
